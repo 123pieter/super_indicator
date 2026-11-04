@@ -1,0 +1,7 @@
+# Direct dependencies; pip resolves their transitive dependencies.
+numpy==2.3.3
+pandas==2.3.2
+plotly==6.9.0
+polygon-api-client==1.16.3
+streamlit==1.56.0
+packaging==25.0

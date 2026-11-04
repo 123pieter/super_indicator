@@ -1,0 +1,11 @@
+.venv/
+.venv.backup-*/
+__pycache__/
+*.py[cod]
+.idea/
+secrets.txt
+.streamlit/secrets.toml
+data/
+*.db
+*.db-*
+*.db.backup-*
