@@ -5,6 +5,7 @@ import analyze
 import config
 import research
 import fetch_history
+from providers import PROVIDERS
 from charts import coin_chart, equity_chart
 from timeframes import TIMEFRAMES, completed_bars
 from ui_helpers import freshness, filter_scanner, format_price, contribution_table
@@ -72,6 +73,9 @@ def run_analysis():
 def scanner():
     timeframe, threshold = settings()
     st.title("Market scanner")
+    if selected_provider() == "all":
+        st.info("Select a single data provider for this view. All providers is available for fetching on Data management.")
+        return
     st.caption(f"{selected_provider()} | {timeframe} candles | {config.LOAD_FROM.upper()} storage | Nine directional votes | Separate ATR regime filter")
     if st.button("Run analysis", type="primary", icon=":material/query_stats:"):
         run_analysis()
@@ -137,6 +141,9 @@ def scanner():
 def coin_detail():
     timeframe, threshold = settings()
     st.title("Coin detail")
+    if selected_provider() == "all":
+        st.info("Select a single data provider for this view. All providers is available for fetching on Data management.")
+        return
     try:
         symbols = analyze.get_available_symbols(timeframe, provider=selected_provider())
     except Exception as exc:
@@ -183,7 +190,11 @@ def coin_detail():
     if view.empty:
         st.info("There are no candles in this date range.")
         return
-    st.plotly_chart(coin_chart(view, threshold), width="stretch", config={"displaylogo": False, "scrollZoom": True})
+    show_bollinger = st.checkbox(
+        "Show Bollinger Bands", key="coin_detail_bollinger",
+        help="20-candle moving average with upper and lower bands two standard deviations away.")
+    st.plotly_chart(coin_chart(view, threshold, show_bollinger=show_bollinger),
+                    width="stretch", config={"displaylogo": False, "scrollZoom": True})
     st.caption(f"Triangle markers show crosses of {threshold:.1f} with the ATR regime filter met. Zoom or hover to inspect; double-click to reset. The score is not a probability of profit.")
     st.subheader("Latest indicator votes")
     st.dataframe(contribution_table(last), hide_index=True, width="stretch", column_config={"Contribution":st.column_config.ProgressColumn("Score contribution", min_value=0., max_value=1/9, format="%.3f")})
@@ -214,103 +225,141 @@ def coin_detail():
         st.dataframe(view.loc[view.cross, ["close","super_score"]].rename(columns={"close":"Price","super_score":"Score"}), width="stretch")
 
 
-def inventory():
+def inventory(providers):
     """Inspect all stored timeframes using the currently configured analysis backend."""
     rows, errors = [], []
-    for timeframe in TIMEFRAMES:
-        try:
-            for symbol in analyze.get_available_symbols(timeframe, provider=selected_provider()):
-                raw = candles(symbol, timeframe, provider=selected_provider())
-                if raw is None:
-                    continue
-                df = completed_bars(raw, timeframe)
-                rows.append({"Coin":symbol,"Timeframe":timeframe,"Stored bars":len(raw),"Completed bars":len(df),"First candle (UTC)":df.index.min() if len(df) else pd.NaT,"Latest candle (UTC)":df.index.max() if len(df) else pd.NaT,"Status":freshness(df.index.max() if len(df) else None,timeframe)[0]})
-        except Exception as exc:
-            errors.append(f"{timeframe}: {exc}")
+    for provider in providers:
+        for timeframe in TIMEFRAMES:
+            try:
+                for symbol in analyze.get_available_symbols(timeframe, provider=provider):
+                    raw = candles(symbol, timeframe, provider=provider)
+                    if raw is None:
+                        continue
+                    df = completed_bars(raw, timeframe)
+                    rows.append({"Provider":provider,"Coin":symbol,"Timeframe":timeframe,"Stored bars":len(raw),"Completed bars":len(df),"First candle (UTC)":df.index.min() if len(df) else pd.NaT,"Latest candle (UTC)":df.index.max() if len(df) else pd.NaT,"Status":freshness(df.index.max() if len(df) else None,timeframe)[0]})
+            except Exception as exc:
+                errors.append(f"{provider} / {timeframe}: {exc}")
     return pd.DataFrame(rows), errors
 
 
-def data_management():
-    timeframe, _ = settings()
-    st.title("Data management")
-    st.caption(f"Inspecting {config.LOAD_FROM.upper()} | Fetch destination: {config.SAVE_TO} | Provider: {selected_provider()}")
-    policy = fetch_history.load_settings(config.DB_PATH, selected_provider(),
-                                        config.PROVIDER_FETCH_DEFAULTS.get(selected_provider()))
-    with st.expander(f"Fetch exclusions: {selected_provider()}"):
-        with st.form(f"provider_fetch_policy_{selected_provider()}"):
+def fetch_policy(provider):
+    policy = fetch_history.load_settings(config.DB_PATH, provider,
+                                        config.PROVIDER_FETCH_DEFAULTS.get(provider))
+    with st.expander(f"Fetch exclusions: {provider}"):
+        with st.form(f"provider_fetch_policy_{provider}"):
             use_limit = st.checkbox("Exclude coins above a previous missing-bar limit", value=policy["max_missing_bars"] is not None)
             max_missing = st.number_input("Maximum previous missing bars", min_value=0, value=policy["max_missing_bars"] if policy["max_missing_bars"] is not None else 30, step=1)
             exclude_empty = st.checkbox("Exclude coins whose previous attempt returned no bars", value=policy["exclude_no_data"])
             st.caption("Rules apply to the last actual attempt for this provider and timeframe. A missing-bar count measures trailing staleness, not gaps throughout the history. API errors are not empty responses. Settings persist across restarts.")
             if st.form_submit_button("Save exclusion settings"):
-                fetch_history.save_settings(config.DB_PATH, selected_provider(),
+                fetch_history.save_settings(config.DB_PATH, provider,
                                             int(max_missing) if use_limit else None, exclude_empty)
-                policy = fetch_history.load_settings(config.DB_PATH, selected_provider())
+                policy = fetch_history.load_settings(config.DB_PATH, provider)
                 st.success("Provider exclusion settings saved.")
-    if selected_provider() == "hyperliquid":
+    return policy
+
+
+def fetch_provider(provider, timeframe, limit, retry_excluded, force_refresh, progress, position, total):
+    """Run one provider/timeframe combination independently, including setup failures."""
+    from fetch_data import main
+
+    outcomes, summary, error = [], None, None
+    prefix = f"{provider} / {timeframe} ({position}/{total})"
+    progress.progress((position-1)/total, text=f"{prefix}: Discovering available pairs...")
+
+    def update(event):
+        nonlocal summary
+        fraction = event.get("completed", 0)/max(1, event.get("total", 1))
+        progress.progress((position-1+fraction)/total,
+                          text=f"{prefix}: {event['event'].capitalize()} {event.get('symbol', timeframe)}")
+        if event["event"] in ("success", "error", "no_data", "no_completed_data", "skipped", "current"):
+            outcomes.append({"Coin": event["symbol"], "Result": event["event"].capitalize(),
+                             "Bars": event.get("bars"),
+                             "Message": event.get("error", event.get("reason", "Saved"))})
+        if event["event"] == "finished":
+            summary = event
+
+    try:
+        main(limit=limit, timeframe=timeframe, on_progress=update,
+             ignore_exclusions=retry_excluded, force_refresh=force_refresh, provider=provider)
+    except Exception as exc:
+        error = str(exc)
+    key = (provider, timeframe)
+    analysis = st.session_state.get("analyses", {}).get(key)
+    if analysis is not None and (summary is None or summary.get("succeeded") or summary.get("local_synced")):
+        analysis["outdated"] = True
+    return dict(provider=provider, timeframe=timeframe, at=pd.Timestamp.now(tz="UTC").isoformat(),
+                summary=summary, outcomes=outcomes, error=error)
+
+
+def data_management():
+    timeframe, _ = settings()
+    selection = selected_provider()
+    providers = PROVIDERS if selection == "all" else (selection,)
+    st.title("Data management")
+    st.caption(f"Inspecting {config.LOAD_FROM.upper()} | Fetch destination: {config.SAVE_TO} | Providers: {', '.join(providers)}")
+    policies = {provider: fetch_policy(provider) for provider in providers}
+    if "hyperliquid" in providers:
         st.info("Hyperliquid supplies perpetual-market candles without an API key. Only the most recent 5,000 candles per coin/timeframe are available; shorter history can limit analysis.")
     with st.container(border=True):
         st.subheader("Update market data")
-        st.write(f"Fetch completed **{timeframe}** candles. Existing history is preserved and recent overlaps are refreshed.")
+        fetch_timeframes = st.multiselect(
+            "Timeframes to fetch", list(TIMEFRAMES), default=[timeframe],
+            key=f"fetch_timeframes_{timeframe}",
+            help="Defaults to the sidebar timeframe. Add more intervals here without changing the analysis timeframe.")
+        jobs = [(provider, interval) for provider in providers for interval in fetch_timeframes]
+        st.caption(f"{len(jobs)} provider/timeframe combinations. Existing candle history is preserved.")
+        if not jobs:
+            st.info("Select at least one timeframe to fetch.")
         limit = st.number_input("Pairs to fetch (0 = all)", min_value=0, value=config.FETCH_LIMIT or 0, step=1)
-        st.caption("Only outdated eligible coins count toward this limit. Current coins use local data; discovery is cached until the next UTC day. Provider access and rate limits apply.")
+        st.caption("The limit applies per provider and timeframe and counts only outdated eligible coins. Current coins use local data; discovery is cached until the next UTC day. Provider access and rate limits apply.")
         force_refresh = st.checkbox("Force refresh", help="Refresh coin discovery and request candles even when current. Exclusions still apply unless Retry previously excluded coins is also selected.")
         retry_excluded = st.checkbox("Retry previously excluded coins this run", help="Temporarily bypass both rules without changing the saved settings.")
-        if st.button("Fetch / Update data", type="primary", icon=":material/sync:"):
-            from fetch_data import main
-            progress = st.progress(0, text="Discovering available pairs...")
-            log = st.empty()
-            outcomes = []
-            summary = None
-            fetch_error = None
-            def update(event):
-                nonlocal summary
-                progress.progress(event.get("completed",0)/max(1,event.get("total",1)), text=f"{event['event'].capitalize()}: {event.get('symbol', timeframe)}")
-                if event["event"] in ("success","error","no_data","no_completed_data","skipped","current"):
-                    outcomes.append({"Coin":event["symbol"],"Result":event["event"].capitalize(),"Bars":event.get("bars"),"Message":event.get("error", event.get("reason", "Saved"))})
-                    log.dataframe(pd.DataFrame(outcomes), hide_index=True, width="stretch")
-                if event["event"] == "finished":
-                    summary = event
+        if st.button("Fetch / Update data", type="primary", icon=":material/sync:", disabled=not jobs):
+            progress = st.progress(0, text="Preparing fetch...")
+            reports = st.session_state.setdefault("fetch_reports", {})
             try:
-                main(limit=int(limit), timeframe=timeframe, on_progress=update, ignore_exclusions=retry_excluded, force_refresh=force_refresh, provider=selected_provider())
-            except Exception as exc:
-                fetch_error = str(exc)
+                for position, (provider, interval) in enumerate(jobs, 1):
+                    reports[(provider, interval)] = fetch_provider(
+                        provider, interval, int(limit), retry_excluded, force_refresh,
+                        progress, position, len(jobs))
             finally:
                 progress.empty()
                 candles.clear()
-                st.session_state.last_fetch = {"provider":selected_provider(),"timeframe":timeframe,"at":pd.Timestamp.now(tz="UTC").isoformat(),"summary":summary,"outcomes":outcomes,"error":fetch_error}
-                if (summary is None or (summary.get("succeeded", 0) or summary.get("local_synced", 0))) and analysis_key() in st.session_state.get("analyses", {}):
-                    st.session_state.analyses[analysis_key()]["outdated"] = True
-            log.empty()
-    last = st.session_state.get("last_fetch")
-    if last and last.get("provider", config.ACTIVE_PROVIDER) == selected_provider():
-        st.caption(f"Last fetch attempt: {last['at']} | {last['timeframe']}")
+    reports = st.session_state.get("fetch_reports", {})
+    for provider, interval in jobs:
+        last = reports.get((provider, interval))
+        if not last:
+            continue
+        st.caption(f"{last['provider']} — Last fetch attempt: {last['at']} | {last['timeframe']}")
         if last.get("error"):
-            st.error(f"Unable to finish fetching: {last['error']}")
+            st.error(f"{provider} / {interval}: Unable to finish fetching: {last['error']}")
         if last["summary"]:
             report = last["summary"]
-            message = f"{report.get('current', 0)} already current, {report.get('skipped', 0)} excluded, {report.get('fetched', report['succeeded']+report['failed'])} fetched: {report['succeeded']} succeeded, {report['failed']} failed."
+            message = f"{provider} / {interval}: {report.get('current', 0)} already current, {report.get('skipped', 0)} excluded, {report.get('fetched', report['succeeded']+report['failed'])} fetched: {report['succeeded']} succeeded, {report['failed']} failed."
             st.caption("Coin discovery: " + ("reused today's saved list" if report.get("discovery_cached") else "refreshed from provider"))
             (st.warning if report["failed"] else st.success)(message)
         if last["outcomes"]:
             st.dataframe(pd.DataFrame(last["outcomes"]), hide_index=True, width="stretch")
     st.subheader("Previous fetch attempts")
-    attempts = fetch_history.load_statuses(config.DB_PATH, selected_provider(), timeframe)
-    if attempts:
-        rows = []
-        for symbol, previous in attempts.items():
-            rows.append({"Coin": symbol, "Outcome": previous["status"], "Attempted (UTC)": previous["attempted_at"],
-                         "Bars returned": previous["bars_returned"], "Latest candle (UTC)": previous["latest_candle"],
-                         "Previous missing bars": previous["missing_bars"],
-                         "Next run": fetch_history.exclusion_reason(previous, policy) or "Eligible",
-                         "Error": previous["error"]})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    else:
-        st.caption(f"No attempts recorded yet for {selected_provider()} / {timeframe}. Existing prices alone do not establish a previous fetch outcome.")
+    for provider, interval in jobs:
+        policy = policies[provider]
+        attempts = fetch_history.load_statuses(config.DB_PATH, provider, interval)
+        if attempts:
+            rows = []
+            for symbol, previous in attempts.items():
+                rows.append({"Provider": provider, "Timeframe": interval, "Coin": symbol, "Outcome": previous["status"], "Attempted (UTC)": previous["attempted_at"],
+                             "Bars returned": previous["bars_returned"], "Latest candle (UTC)": previous["latest_candle"],
+                             "Previous missing bars": previous["missing_bars"],
+                             "Next run": fetch_history.exclusion_reason(previous, policy) or "Eligible",
+                             "Error": previous["error"]})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        else:
+            st.caption(f"No attempts recorded yet for {provider} / {interval}. Existing prices alone do not establish a previous fetch outcome.")
     st.subheader("Storage coverage")
     if st.button("Refresh coverage"):
         candles.clear()
-    frame, errors = inventory()
+    frame, errors = inventory(providers)
     for error in errors:
         st.error(error)
     if frame.empty:
@@ -330,6 +379,9 @@ def indicator_backtest():
     timeframe, _ = settings()
     provider = selected_provider()
     st.title("Indicator backtest")
+    if selected_provider() == "all":
+        st.info("Select a single data provider for this view. All providers is available for fetching on Data management.")
+        return
     st.caption(f"{provider} | {timeframe} | Stored completed candles only | Independent long and short experiments")
     try:
         symbols = analyze.get_available_symbols(timeframe, provider=provider)
@@ -466,3 +518,228 @@ def indicator_backtest():
     st.download_button("Export experiment trades", trades.to_csv(index=False).encode("utf-8"),
                        file_name=f"indicator_trades_{provider}_{timeframe}_{inspected_coin.replace(':','_')}_{chosen.replace(':','_')}.csv", mime="text/csv")
     st.caption("These are in-sample experiments, not proof of predictive value. No candidate is selected automatically. Funding, borrow costs, liquidity limits and venue liquidation rules are excluded. Experiments that exhaust short capital are marked unavailable; losses are never clipped. Drawdown uses candle closes and excludes intrabar extremes. Positions close at the end of the test.")
+
+def research_settings():
+    """Keep strategy editing, batch execution, and saved reports in separate tabs."""
+    from research_lab.runner import BASELINE_CONFIG
+
+    st.title("Research lab")
+    settings_tab, batch_tab, reports_tab = st.tabs(["Settings", "Run batch", "Reports"])
+    with settings_tab:
+        selection = _research_config_form()
+    with batch_tab:
+        if selection is None:
+            st.info("Open a valid strategy config in Settings before starting a batch.")
+        else:
+            strategy, using_validated = selection
+            _research_batch_controls(strategy, using_validated=using_validated)
+    with reports_tab:
+        _research_reports(BASELINE_CONFIG.parents[1]/"research_runs")
+
+
+def _research_config_form():
+    """Return the last validated strategy for the current source, or its loaded defaults."""
+    import hashlib
+    import json
+    from research_lab.runner import BASELINE_CONFIG, METHODS, load_config, validate_config
+
+    st.caption("Configure a research strategy, validate it, then go to Run batch. You can also download its JSON. The live score is unchanged.")
+    upload = st.file_uploader("Open an existing research config (optional)", type=["json"])
+    try:
+        if upload is not None:
+            defaults = validate_config(json.loads(upload.getvalue().decode("utf-8-sig")))
+        else:
+            defaults = load_config(BASELINE_CONFIG)
+    except (ValueError, OSError) as exc:
+        st.error(f"Unable to open config: {exc}")
+        return
+    source = hashlib.sha256(json.dumps(defaults, sort_keys=True).encode()).hexdigest()[:16]
+    labels = {"sma_trend": "SMA trend", "bollinger_reentry": "Bollinger mean reversion"}
+    components = {item["rule"]: item for item in defaults["components"]}
+    risk = defaults["execution"]
+    combination = defaults["combination"]
+    with st.form(f"research_settings_{source}"):
+        name = st.text_input("Strategy name", value=defaults["name"])
+        provider = st.selectbox("Research data provider", PROVIDERS, index=PROVIDERS.index(defaults["provider"]))
+        rules = st.multiselect("Indicator components", list(labels), default=list(components), format_func=labels.get)
+        st.caption("Only selected components are included. Windows count candles on the timeframe being tested.")
+        a, b = st.columns(2)
+        sma_window = a.number_input("SMA window", min_value=2, value=components.get("sma_trend", {}).get("window", 100))
+        sma_weight = a.number_input("SMA weight", min_value=0., value=float(components.get("sma_trend", {}).get("weight", 1.)))
+        bb_window = b.number_input("Bollinger window", min_value=2, value=components.get("bollinger_reentry", {}).get("window", 20))
+        bb_width = b.number_input("Bollinger standard deviations", min_value=0., value=float(components.get("bollinger_reentry", {}).get("deviations", 2.)))
+        bb_weight = b.number_input("Bollinger weight", min_value=0., value=float(components.get("bollinger_reentry", {}).get("weight", 1.)))
+
+        method = st.selectbox("Combination rule", METHODS, index=METHODS.index(combination["method"]),
+                              format_func={"majority":"Strict majority", "weighted":"Weighted score",
+                                           "and":"AND (unanimous)", "or":"OR (no conflict)"}.get)
+        threshold = st.number_input("Weighted score threshold", min_value=0., max_value=1.,
+                                    value=float(combination["threshold"]), step=.05)
+        st.caption("Weights and threshold apply only to Weighted score. Flat votes count toward the denominator. Opposing votes offset one another in the weighted score; OR goes flat on any conflict.")
+
+        st.subheader("Execution and risk")
+        a, b = st.columns(2)
+        capital = a.number_input("Starting capital", min_value=0., value=float(risk["initial_capital"]))
+        sizing = b.selectbox("Position sizing", ("fixed", "atr_risk"), index=int(risk["sizing"] == "atr_risk"),
+                             format_func={"fixed":"Fixed fraction", "atr_risk":"ATR risk"}.get)
+        fraction = a.number_input("Fixed allocation (%)", 0., 100., float(risk["fraction"])*100)
+        risk_pct = b.number_input("Risk at stop (%)", 0., 100., float(risk["risk_fraction"])*100)
+        exposure = a.number_input("Maximum exposure (%)", 0., 100., float(risk["max_exposure"])*100)
+        fee = a.number_input("Research fee per side (%)", 0., 100., float(risk["fee"])*100, step=.01, format="%.4f")
+        slippage = b.number_input("Research slippage per side (%)", 0., 100., float(risk["slippage"])*100, step=.01, format="%.4f")
+        use_stop = a.checkbox("Enable stop-loss", value=risk["stop_atr"] is not None)
+        stop = a.number_input("Stop distance (ATR multiples)", min_value=0., value=float(risk["stop_atr"] or 2.))
+        use_target = b.checkbox("Enable take-profit", value=risk["target_atr"] is not None)
+        target = b.number_input("Target distance (ATR multiples)", min_value=0., value=float(risk["target_atr"] or 3.))
+        submit = st.form_submit_button("Validate research settings", type="primary")
+
+    key = "validated_research_settings"
+    if submit:
+        options = {
+            "sma_trend": dict(rule="sma_trend", window=sma_window, weight=sma_weight),
+            "bollinger_reentry": dict(rule="bollinger_reentry", window=bb_window, weight=bb_weight, deviations=bb_width),
+        }
+        try:
+            validated = validate_config(dict(
+                version=1, name=name, provider=provider, components=[options[rule] for rule in rules],
+                combination=dict(method=method, threshold=threshold),
+                execution=dict(initial_capital=capital, sizing=sizing, fraction=fraction/100,
+                               risk_fraction=risk_pct/100, max_exposure=exposure/100,
+                               fee=fee/100, slippage=slippage/100,
+                               stop_atr=stop if use_stop else None, target_atr=target if use_target else None),
+            ))
+        except ValueError as exc:
+            st.session_state.pop(key, None)
+            st.error(str(exc))
+        else:
+            st.session_state[key] = (source, validated)
+    saved = st.session_state.get(key)
+    if saved and saved[0] == source:
+        st.success("Settings validated. Download to save this version.")
+        output = json.dumps(saved[1], indent=2) + "\n"
+        st.download_button("Download research config", output, file_name="research_strategy.json",
+                           mime="application/json")
+        with st.expander("Validated JSON"):
+            st.code(output, language="json")
+
+    if saved and saved[0] == source:
+        return saved[1], True
+    return defaults, False
+
+
+def _research_batch_controls(strategy, *, using_validated):
+    """Run the same provider/asset/timeframe selection as the research CLI."""
+    import sqlite3
+    from research_lab.data import open_ohlcv, stored_pairs
+    from research_lab.runner import BASELINE_CONFIG, run_batch
+
+    st.subheader("Run research batch")
+    provider = strategy["provider"]
+    source = "last validated settings" if using_validated else "loaded config"
+    st.caption(f"Using {source}: {strategy['name']} ({provider}). "
+               "Validate research settings in the Settings tab to apply any form edits. Results are historical only.")
+    try:
+        with open_ohlcv(config.DB_PATH) as conn:
+            pairs = stored_pairs(conn, provider)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        st.error(f"Unable to list stored research candles: {exc}")
+        return
+    intervals = sorted({interval for _, interval in pairs})
+    if not intervals:
+        st.info("No stored SQLite candles for this provider. Fetch data before running a batch.")
+        return
+    all_intervals = "All stored timeframes"
+    default = intervals.index(config.DEFAULT_TIMEFRAME)+1 if config.DEFAULT_TIMEFRAME in intervals else 1
+    chosen_interval = st.selectbox("Batch timeframe", [all_intervals, *intervals], index=default,
+                                   key=f"research_batch_interval_{provider}")
+    timeframe = None if chosen_interval == all_intervals else chosen_interval
+    symbols = sorted({symbol for symbol, interval in pairs if timeframe is None or interval == timeframe})
+    all_symbols = "All stored assets"
+    symbol_choice = st.selectbox("Batch asset", [all_symbols, *symbols], index=1,
+                                 key=f"research_batch_asset_{provider}_{chosen_interval}")
+    symbol = None if symbol_choice == all_symbols else symbol_choice
+    count = sum((symbol is None or s == symbol) and (timeframe is None or t == timeframe)
+                for s, t in pairs)
+    st.caption(f"{count} stored asset/timeframe pairs selected. Buy-and-hold and SMA100 benchmarks are included.")
+
+    if st.button("Run research batch", type="primary"):
+        progress = st.progress(0., text="Preparing research batch…")
+        try:
+            folder, manifest = run_batch(
+                [strategy], config.DB_PATH, BASELINE_CONFIG.parents[1]/"research_runs",
+                symbol=symbol, timeframe=timeframe,
+                on_progress=lambda i,n,s,t: progress.progress(i/n,text=f"{i}/{n}: {s} / {t}"),
+            )
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            st.error(f"Research batch failed: {exc}")
+        else:
+            st.session_state["last_research_batch"] = dict(
+                folder=str(folder), jobs=manifest["jobs"], name=strategy["name"],
+                provider=provider, symbol=symbol_choice, timeframe=chosen_interval,
+            )
+        finally:
+            progress.empty()
+
+    last = st.session_state.get("last_research_batch")
+    if last:
+        from pathlib import Path
+        jobs = last["jobs"]
+        status = st.warning if jobs["failed"] or jobs["skipped"] else st.success
+        status(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']} — "
+               f"{jobs['completed']} completed, {jobs['skipped']} skipped, {jobs['failed']} failed.")
+        st.code(last["folder"], language=None)
+        try:
+            results = (Path(last["folder"])/"results.csv").read_bytes()
+            from io import BytesIO
+            st.dataframe(pd.read_csv(BytesIO(results), dtype={"symbol": str}, keep_default_na=False),
+                         hide_index=True, width="stretch")
+            st.download_button("Download batch results", results, file_name="results.csv", mime="text/csv")
+        except OSError as exc:
+            st.warning(f"Unable to read saved results: {exc}")
+
+def _research_reports(root):
+    """Show saved, locally generated HTML reports without running a strategy."""
+    import sqlite3
+    from research_lab.report import generate_report
+
+    st.subheader("Saved research reports")
+    try:
+        root = root.resolve()
+        runs = {
+            folder.name: folder for folder in sorted(root.iterdir(), reverse=True)
+            if folder.is_dir() and folder.resolve().parent == root
+            and (folder/"manifest.json").is_file()
+        } if root.is_dir() else {}
+    except OSError as exc:
+        st.error(f"Unable to list research runs: {exc}")
+        return
+    if not runs:
+        st.info("Complete a research batch to view its report here.")
+        return
+    selected = st.selectbox("Saved research run", list(runs), key="saved_research_report")
+    folder = runs[selected]
+    path = folder/"report.html"
+    if path.resolve().parent != folder.resolve():
+        st.error("The report is outside its run folder.")
+        return
+    if not path.is_file():
+        st.info("This run has no HTML report yet. Generating it uses the saved results.")
+        if not st.button("Generate report", key=f"generate_research_report_{selected}"):
+            return
+        try:
+            with st.spinner("Building report from saved results…"):
+                generate_report(folder)
+        except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+            st.error(f"Unable to generate report: {exc}")
+            return
+    try:
+        html = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        st.error(f"Unable to open report: {exc}")
+        return
+    # Local sibling file links work when opening the file directly, not in srcdoc.
+    head, marker, tail = html.partition("<p><a href='metrics_per_asset.csv'>")
+    if marker and "</p>" in tail:
+        html = head + tail.split("</p>", 1)[1]
+    st.caption("Interactive view of the saved report. The original HTML and CSV files remain in the run folder.")
+    st.iframe(html, height=800)

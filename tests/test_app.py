@@ -69,7 +69,7 @@ class AppInteractionTests(unittest.TestCase):
         with patch.object(fetch_data,"main",side_effect=fake_fetch):
             next(b for b in app.button if b.label=="Fetch / Update data").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(app.session_state["last_fetch"]["summary"]["succeeded"],1)
+        self.assertEqual(app.session_state["fetch_reports"][("polygon","1d")]["summary"]["succeeded"],1)
         self.assertTrue(any("1 succeeded" in s.value for s in app.success))
 
     def test_fetch_setup_error_is_visible(self):
@@ -198,3 +198,57 @@ class AppInteractionTests(unittest.TestCase):
         self.assertEqual(len(r["aggregate"]),7)
         self.assertEqual(set(r["per_coin"].Coin),{"AAA","BBB"})
         self.assertTrue(r["aggregate"].valid_coins.eq(2).all())
+
+    def test_all_providers_fetch_continues_after_failure(self):
+        """One click attempts both providers for the same timeframe, even if Polygon fails."""
+        def fake_fetch(provider, timeframe, on_progress, **options):
+            self.assertEqual(timeframe, "1d")
+            if provider == "polygon":
+                raise RuntimeError("Missing credentials")
+            on_progress(dict(event="finished", completed=1, total=1, succeeded=1, failed=0))
+            return 0
+
+        app = self.page("data_management", provider="all")
+        self.assertFalse(app.exception)
+        with patch.object(fetch_data, "main", side_effect=fake_fetch) as fetch:
+            next(b for b in app.button if b.label=="Fetch / Update data").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual([call.kwargs["provider"] for call in fetch.call_args_list], ["polygon", "hyperliquid"])
+        self.assertTrue(any("polygon" in e.value and "Missing credentials" in e.value for e in app.error))
+        self.assertTrue(any("hyperliquid" in m.value and "1 succeeded" in m.value for m in app.success))
+
+    def test_all_providers_is_fetch_only(self):
+        """Research views explain the selection without treating all as a market provider."""
+        for view in ("scanner", "coin_detail", "indicator_backtest"):
+            app = self.page(view, provider="all")
+            self.assertFalse(app.exception)
+            self.assertTrue(any("Select a single data provider" in i.value for i in app.info))
+
+    def test_multiple_fetch_timeframes_run_each_provider_and_keep_reports(self):
+        """One click runs the full grid, forwards shared options, and retains distinct reports."""
+        def fake_fetch(provider, timeframe, on_progress, **options):
+            if (provider, timeframe) == ("polygon", "1h"):
+                raise RuntimeError("Hourly candles unavailable")
+            on_progress(dict(event="finished", completed=1, total=1, succeeded=1, failed=0))
+            return 0
+
+        app = self.page("data_management", provider="all")
+        next(m for m in app.multiselect if m.label == "Timeframes to fetch").set_value(["1d", "1h"]).run()
+        next(c for c in app.checkbox if c.label == "Force refresh").check().run()
+        with patch.object(fetch_data, "main", side_effect=fake_fetch) as fetch:
+            next(b for b in app.button if b.label == "Fetch / Update data").click().run()
+        self.assertFalse(app.exception)
+        expected = [("polygon", "1d"), ("polygon", "1h"), ("hyperliquid", "1d"), ("hyperliquid", "1h")]
+        self.assertEqual([(c.kwargs["provider"], c.kwargs["timeframe"]) for c in fetch.call_args_list], expected)
+        self.assertTrue(all(c.kwargs["force_refresh"] for c in fetch.call_args_list))
+        self.assertEqual(set(app.session_state["fetch_reports"]), set(expected))
+        self.assertEqual(len(app.success), 3)
+        self.assertTrue(any("polygon / 1h" in e.value for e in app.error))
+
+    def test_empty_fetch_timeframes_disable_fetch(self):
+        """Clearing all intervals prevents a fetch instead of falling back silently."""
+        app = self.page("data_management")
+        field = next(m for m in app.multiselect if m.label == "Timeframes to fetch")
+        self.assertEqual(field.value, ["1d"])
+        field.set_value([]).run()
+        self.assertTrue(next(b for b in app.button if b.label == "Fetch / Update data").disabled)

@@ -3,13 +3,26 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-def coin_chart(frame, threshold):
-    """Share time axes across price, volume, and score; show only genuine threshold crosses."""
+def coin_chart(frame, threshold, *, show_bollinger=False):
+    """Share time axes across price, volume, and score, with optional price overlays."""
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
                         row_heights=[.55, .16, .29], vertical_spacing=.035)
     fig.add_trace(go.Candlestick(x=frame.index, open=frame.open, high=frame.high,
                                 low=frame.low, close=frame.close, name="Price",
                                 increasing_line_color="#0f766e", decreasing_line_color="#dc5b5b"), row=1, col=1)
+    if show_bollinger:
+        middle = frame.bb_mid
+        spread = 2 * frame.bb_std
+        for label, values, dash in (
+            ("Upper", middle + spread, "solid"),
+            ("Middle", middle, "dash"),
+            ("Lower", middle - spread, "solid"),
+        ):
+            fig.add_trace(go.Scatter(
+                x=frame.index, y=values, mode="lines", name=f"Bollinger {label}",
+                line=dict(color="#7c3aed", width=1.3, dash=dash),
+                hovertemplate=f"Bollinger {label}: %{{y:.6g}}<extra></extra>",
+            ), row=1, col=1)
     # Crosses are computed before date filtering so a boundary does not create a fake signal.
     signals = frame.loc[frame["cross"]]
     fig.add_trace(go.Scatter(x=signals.index, y=signals.low*.98, mode="markers",

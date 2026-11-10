@@ -132,7 +132,7 @@ Select **hyperliquid** under **Data provider**. The same scanner, charts, timefr
 
 No Hyperliquid API key, wallet, signing library, or new Python dependency is needed. The JSON POST and metadata-discovery pattern was adapted from the earlier arbitrage scanner; all implementation lives here and does not import that project.
 
-Hyperliquid exposes only its **latest 5,000 candles per interval**. Requests are clamped to that available window. An older START_DATE cannot retrieve candles beyond it. Newly listed markets or short intraday windows may not meet MIN_BARS. Incremental collection retains previously stored candles as they age out of the public API window. The provider's request delay is HYPERLIQUID_REQUEST_DELAY; Polygon retains REQUEST_DELAY.
+Hyperliquid exposes only its **latest 5,000 candles per interval**. Requests are clamped to that available window. An older START_DATE cannot retrieve candles beyond it. Newly listed markets or short intraday windows may not meet MIN_BARS. Incremental collection retains previously stored candles as they age out of the public API window. Hyperliquid uses HYPERLIQUID_REQUEST_DELAY between coins. Polygon uses REQUEST_DELAY between individual HTTP requests, including discovery and pagination. HTTP 429 retries wait at least 60 seconds (or longer if Retry-After requests it), with at most three attempts per page.
 
 The default HYPERLIQUID_DEXES tuple contains only the native perpetual dex (`""`). Optional builder-deployed dexes such as `"xyz"` or `"km"` can be added there. Their raw names, e.g. `xyz:CL`, retain the namespace and use percent-escaped CSV filenames for Windows compatibility. Changing the dex list requires Force refresh to refresh discovery immediately.
 
@@ -231,3 +231,12 @@ Export both per-coin and aggregate tables as CSV. Choose **Inspect coin** and th
 **Inspect experiment** to view the exact matching equity curve and individual trades.
 Runs remain separate by provider, timeframe and selected coin list. All data reads
 are local; this feature does not fetch market data or change the live indicator.
+
+### Fetching several timeframes
+
+On **Data management**, choose a provider (or **All providers**) in the sidebar,
+then select the intervals under **Timeframes to fetch** and click **Fetch / Update data**.
+The list defaults to the sidebar timeframe. Fetches run sequentially for each
+provider and timeframe combination, with separate progress and results. The pair
+limit applies to each combination, and exclusion settings remain provider-specific.
+The sidebar timeframe still controls analysis.

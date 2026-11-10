@@ -1,0 +1,4 @@
+provider,symbol,timeframe,experiment,status,message,first_execution,last_candle,trades,final_equity,total_return_pct
+hyperliquid,AAVE,1d,strategy:1,completed,,2024-09-09 00:00:00+00:00,2026-11-07 00:00:00+00:00,42,1126.98763629142,12.698763629141997
+hyperliquid,AAVE,1d,benchmark:1:buy_hold,completed,,2024-09-09 00:00:00+00:00,2026-11-07 00:00:00+00:00,1,1042.308480376863,4.230848037686297
+hyperliquid,AAVE,1d,benchmark:1:sma100,completed,,2024-09-09 00:00:00+00:00,2026-11-07 00:00:00+00:00,12,1823.4829255706338,82.34829255706337

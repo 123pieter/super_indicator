@@ -16,7 +16,7 @@ START_DATE = "2024-06-01"
 MIN_BARS = 250
 BUY_THRESHOLD = 0.7
 FETCH_LIMIT = 0  # None or 0 fetches all available pairs.
-REQUEST_DELAY = 12
+REQUEST_DELAY = 15  # Seconds between individual Polygon HTTP requests, including pages.
 
 
 def load_api_key(filepath=None):

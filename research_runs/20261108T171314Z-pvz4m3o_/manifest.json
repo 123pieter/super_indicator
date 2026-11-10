@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "provider": "hyperliquid",
+  "as_of": "2026-11-08 17:13:14.542911+00:00",
+  "database": "C:\\Users\\Dell\\PycharmProjects\\super_indicator\\crypto_data.db",
+  "evaluation": "historical descriptive; no holdout or parameter selection",
+  "independent_capital_per_pair": true,
+  "shorts": "hypothetical; excludes funding, borrow and venue liquidation",
+  "warmup_candles": 100,
+  "asset_timeframe_pairs": 1,
+  "strategy_configs": 1,
+  "unique_strategy_settings": 1,
+  "benchmark_configs": 2,
+  "planned_strategy_jobs": 1,
+  "planned_jobs": 3,
+  "jobs": {
+    "completed": 3,
+    "skipped": 0,
+    "failed": 0
+  },
+  "experiments": [
+    {
+      "id": "strategy:1",
+      "name": "Trend and Bollinger research example",
+      "kind": "strategy",
+      "group": 1,
+      "execution": {
+        "initial_capital": 1000,
+        "fee": 0.001,
+        "slippage": 0.0005,
+        "sizing": "fixed",
+        "fraction": 0.1,
+        "risk_fraction": 0.01,
+        "max_exposure": 1.0,
+        "stop_atr": 2.0,
+        "target_atr": 3.0
+      },
+      "config": {
+        "version": 1,
+        "name": "Trend and Bollinger research example",
+        "provider": "hyperliquid",
+        "components": [
+          {
+            "rule": "sma_trend",
+            "window": 100,
+            "weight": 1.0
+          },
+          {
+            "rule": "bollinger_reentry",
+            "window": 20,
+            "weight": 1.0,
+            "deviations": 2.0
+          }
+        ],
+        "combination": {
+          "method": "weighted",
+          "threshold": 0.5
+        },
+        "execution": {
+          "initial_capital": 1000,
+          "fee": 0.001,
+          "slippage": 0.0005,
+          "sizing": "fixed",
+          "fraction": 0.1,
+          "risk_fraction": 0.01,
+          "max_exposure": 1.0,
+          "stop_atr": 2.0,
+          "target_atr": 3.0
+        }
+      }
+    },
+    {
+      "id": "benchmark:1:buy_hold",
+      "name": "Buy and hold",
+      "kind": "buy_hold",
+      "group": 1,
+      "execution": {
+        "initial_capital": 1000,
+        "fee": 0.001,
+        "slippage": 0.0005,
+        "sizing": "fixed",
+        "fraction": 1.0,
+        "risk_fraction": 0.01,
+        "max_exposure": 1.0,
+        "stop_atr": null,
+        "target_atr": null
+      },
+      "config": null
+    },
+    {
+      "id": "benchmark:1:sma100",
+      "name": "SMA100 long/cash",
+      "kind": "sma100",
+      "group": 1,
+      "execution": {
+        "initial_capital": 1000,
+        "fee": 0.001,
+        "slippage": 0.0005,
+        "sizing": "fixed",
+        "fraction": 1.0,
+        "risk_fraction": 0.01,
+        "max_exposure": 1.0,
+        "stop_atr": null,
+        "target_atr": null
+      },
+      "config": null
+    }
+  ],
+  "coverage": [
+    {
+      "symbol": "AAVE",
+      "timeframe": "1d",
+      "stored": 890,
+      "usable": 890,
+      "first_utc": "2024-06-01 00:00:00+00:00",
+      "last_utc": "2026-11-07 00:00:00+00:00",
+      "bad_timestamp": 0,
+      "off_grid": 0,
+      "duplicate_rows": 0,
+      "invalid_ohlcv": 0,
+      "future": 0,
+      "unfinished": 0,
+      "internal_missing": 0,
+      "trailing_missing": 0,
+      "status": "ok",
+      "data_sha256": "71cd46bdec7c51aa8bf90a6e07814603619e407be8c80fc8e0d2cbbbb8470be4"
+    }
+  ]
+}

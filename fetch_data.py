@@ -109,7 +109,8 @@ def main(limit=config.FETCH_LIMIT, timeframe=config.DEFAULT_TIMEFRAME, on_progre
     print(f"Fetching {len(tickers)} {timeframe} pairs through {end}; {len(skipped)} excluded", flush=True)
     for i, (symbol, ticker) in enumerate(tickers, len(current)+len(skipped)+1):
         report(event="fetching", symbol=symbol, completed=i-1, total=total)
-        time.sleep(config.REQUEST_DELAY if provider_name == "polygon" else config.HYPERLIQUID_REQUEST_DELAY)
+        if provider_name == "hyperliquid":
+            time.sleep(config.HYPERLIQUID_REQUEST_DELAY)
         known = pd.DataFrame()
         returned = 0
         status, error = "success", None

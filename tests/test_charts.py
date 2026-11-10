@@ -17,6 +17,18 @@ class ChartTests(unittest.TestCase):
         self.assertEqual(fig.layout.shapes[0].y0, .7)
         self.assertEqual(fig.layout.xaxis.matches, "x3")
 
+    def test_bollinger_overlay_uses_full_history_and_price_axis(self):
+        """A zoomed date range keeps precomputed bands and plots all three on the price panel."""
+        frame = compute_indicators(bars()).tail(5).assign(cross=False)
+        fig = coin_chart(frame, .7, show_bollinger=True)
+        overlays = {t.name: t for t in fig.data if t.name.startswith("Bollinger")}
+        self.assertEqual(set(overlays), {"Bollinger Upper", "Bollinger Middle", "Bollinger Lower"})
+        for label, multiplier in (("Upper", 2), ("Middle", 0), ("Lower", -2)):
+            trace = overlays[f"Bollinger {label}"]
+            self.assertEqual(trace.yaxis, "y")
+            self.assertEqual(list(trace.x), list(frame.index))
+            self.assertEqual(list(trace.y), list(frame.bb_mid + multiplier * frame.bb_std))
+
     def test_selected_equity_matches_loss_instead_of_another_experiment(self):
         """A -58.57% experiment plots its0.4143 equity, not another curve above2."""
         import pandas as pd
