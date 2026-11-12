@@ -34,7 +34,7 @@ def stored_pairs(conn, provider):
     ).fetchall()
 
 
-def load_pair(conn, provider, symbol, timeframe, as_of=None):
+def load_pair(conn, provider, symbol, timeframe, as_of=None, *, historical_cutoff=False):
     """Return sorted, completed UTC candles and audit counts for one stored pair.
 
     Invalid rows and all copies of a duplicated timestamp are excluded. The
@@ -56,6 +56,11 @@ def load_pair(conn, provider, symbol, timeframe, as_of=None):
     date = raw.date.astype("string")
     timestamps = pd.to_datetime(date.where(date.str.fullmatch(_ISO_TIMESTAMP, na=False)),
                                 utc=True, format="mixed", errors="coerce")
+    if historical_cutoff:
+        # A deliberate development boundary is not a future-data anomaly.
+        keep = timestamps.isna() | timestamps.lt(cutoff)
+        raw, timestamps = raw.loc[keep], timestamps.loc[keep]
+        report["stored"] = len(raw)
     prices = raw[COLUMNS].apply(pd.to_numeric, errors="coerce")
     valid_values = (
         np.isfinite(prices).all(axis=1)
@@ -82,9 +87,58 @@ def load_pair(conn, provider, symbol, timeframe, as_of=None):
         future=int(future.sum()), unfinished=int((timestamps.notna() & ~future & ~complete).sum()),
         internal_missing=gaps, trailing_missing=missing_bars(last, timeframe, cutoff),
     )
-    issues = ("bad_timestamp", "off_grid", "duplicate_rows", "invalid_ohlcv", "future", "internal_missing")
-    report["status"] = "check required" if not len(usable) or any(report[key] for key in issues) else "ok"
+    report["status"] = "check required" if audit_problem(report) else "ok"
     return usable, report
+
+
+def audit_problem(report, *, allow_internal_gaps=False):
+    """Describe the blocking checks. Unfinished candles and trailing lag are informational."""
+    if report.get("status") == "unsupported timeframe":
+        return "unsupported timeframe"
+    checks = {
+        "internal_missing": "missing candles within stored history",
+        "bad_timestamp": "unreadable timestamps",
+        "off_grid": "timestamps off the timeframe grid",
+        "duplicate_rows": "rows with duplicate timestamps",
+        "invalid_ohlcv": "invalid OHLCV rows",
+        "future": "candles dated after the audit cutoff",
+    }
+    if allow_internal_gaps:
+        del checks["internal_missing"]
+    details = [f"{report[key]} {label}" for key, label in checks.items() if report[key]]
+    if not report["usable"]:
+        details.insert(0, "no usable completed candles")
+    return "; ".join(details)
+
+
+def backtest_history(candles, audit, latest_continuous):
+    """Use the newest uninterrupted suffix when internal gaps are the only issue."""
+    if (not latest_continuous or not audit.get("internal_missing")
+            or audit_problem(audit, allow_internal_gaps=True)):
+        return candles, False
+    duration = TIMEFRAMES[audit["timeframe"]].duration
+    jumps = candles.index.to_series().diff().gt(duration)
+    start = jumps[jumps].index[-1]
+    return candles.loc[start:], True
+
+
+def fill_empty_candles(candles, timeframe, confirmed_dates):
+    """Fill only confirmed internal gaps; leave unresolved histories untouched."""
+    if not confirmed_dates or candles.empty:
+        return candles
+    grid = pd.date_range(candles.index[0], candles.index[-1],
+                         freq=TIMEFRAMES[timeframe].duration, name=candles.index.name)
+    missing = grid.difference(candles.index)
+    confirmed = pd.to_datetime(list(confirmed_dates), utc=True)
+    if missing.empty or not missing.isin(confirmed).all():
+        return candles
+    frame = candles.reindex(grid)
+    frame["synthetic"] = grid.isin(missing)
+    carry = frame.close.ffill()
+    for column in ("open", "high", "low", "close"):
+        frame.loc[missing, column] = carry.loc[missing]
+    frame.loc[missing, "volume"] = 0.
+    return frame
 
 
 def audit_database(database, provider, as_of=None):

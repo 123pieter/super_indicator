@@ -13,6 +13,12 @@ SAVE_TO = "both"  # csv, sqlite, or both
 LOAD_FROM = "csv"  # csv or sqlite
 DEFAULT_TIMEFRAME = "1d"
 START_DATE = "2024-06-01"
+
+# Exact internal dates for which the provider returned no daily or hourly bars.
+# Add dates only after a successful provider query confirms the interval is empty.
+CONFIRMED_EMPTY_CANDLES = {
+    ("polygon", "00", "1d"): ("2025-02-05", "2025-09-19"),
+}
 MIN_BARS = 250
 BUY_THRESHOLD = 0.7
 FETCH_LIMIT = 0  # None or 0 fetches all available pairs.

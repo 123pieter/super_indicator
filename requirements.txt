@@ -5,3 +5,4 @@ plotly==6.9.0
 polygon-api-client==1.16.3
 streamlit==1.56.0
 packaging==25.0
+openpyxl==3.1.5

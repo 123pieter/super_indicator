@@ -521,123 +521,76 @@ def indicator_backtest():
 
 def research_settings():
     """Keep strategy editing, batch execution, and saved reports in separate tabs."""
-    from research_lab.runner import BASELINE_CONFIG
+    from research_lab.runner import RUNS_DIR
 
     st.title("Research lab")
     settings_tab, batch_tab, reports_tab = st.tabs(["Settings", "Run batch", "Reports"])
     with settings_tab:
-        selection = _research_config_form()
+        configs = _research_workbook_form()
     with batch_tab:
-        if selection is None:
-            st.info("Open a valid strategy config in Settings before starting a batch.")
+        if configs is None:
+            st.info("Open a valid strategy workbook in Settings before starting a batch.")
         else:
-            strategy, using_validated = selection
-            _research_batch_controls(strategy, using_validated=using_validated)
+            _research_batch_controls(configs)
     with reports_tab:
-        _research_reports(BASELINE_CONFIG.parents[1]/"research_runs")
+        _research_reports(RUNS_DIR)
 
 
-def _research_config_form():
-    """Return the last validated strategy for the current source, or its loaded defaults."""
-    import hashlib
-    import json
-    from research_lab.runner import BASELINE_CONFIG, METHODS, load_config, validate_config
+def _research_workbook_form():
+    """Preview a project workbook or an uploaded copy without running it."""
+    from research_lab.runner import duplicate_signal_count, is_intraday_strategy
+    from research_lab.workbook import WORKBOOK_PATH, load_workbook_configs
 
-    st.caption("Configure a research strategy, validate it, then go to Run batch. You can also download its JSON. The live score is unchanged.")
-    upload = st.file_uploader("Open an existing research config (optional)", type=["json"])
+    upload = st.file_uploader("Upload a strategy workbook (optional)", type=["xlsx"],
+                              key="research_workbook")
+    provider = st.selectbox("Workbook data provider", PROVIDERS, key="research_workbook_provider")
+    st.caption("Without an upload, the app reads the project strategy workbook. Save your Excel changes before previewing.")
     try:
-        if upload is not None:
-            defaults = validate_config(json.loads(upload.getvalue().decode("utf-8-sig")))
-        else:
-            defaults = load_config(BASELINE_CONFIG)
+        configs = load_workbook_configs(upload or WORKBOOK_PATH, provider)
     except (ValueError, OSError) as exc:
-        st.error(f"Unable to open config: {exc}")
+        st.error(f"Workbook validation failed: {exc}")
         return
-    source = hashlib.sha256(json.dumps(defaults, sort_keys=True).encode()).hexdigest()[:16]
-    labels = {"sma_trend": "SMA trend", "bollinger_reentry": "Bollinger mean reversion"}
-    components = {item["rule"]: item for item in defaults["components"]}
-    risk = defaults["execution"]
-    combination = defaults["combination"]
-    with st.form(f"research_settings_{source}"):
-        name = st.text_input("Strategy name", value=defaults["name"])
-        provider = st.selectbox("Research data provider", PROVIDERS, index=PROVIDERS.index(defaults["provider"]))
-        rules = st.multiselect("Indicator components", list(labels), default=list(components), format_func=labels.get)
-        st.caption("Only selected components are included. Windows count candles on the timeframe being tested.")
-        a, b = st.columns(2)
-        sma_window = a.number_input("SMA window", min_value=2, value=components.get("sma_trend", {}).get("window", 100))
-        sma_weight = a.number_input("SMA weight", min_value=0., value=float(components.get("sma_trend", {}).get("weight", 1.)))
-        bb_window = b.number_input("Bollinger window", min_value=2, value=components.get("bollinger_reentry", {}).get("window", 20))
-        bb_width = b.number_input("Bollinger standard deviations", min_value=0., value=float(components.get("bollinger_reentry", {}).get("deviations", 2.)))
-        bb_weight = b.number_input("Bollinger weight", min_value=0., value=float(components.get("bollinger_reentry", {}).get("weight", 1.)))
-
-        method = st.selectbox("Combination rule", METHODS, index=METHODS.index(combination["method"]),
-                              format_func={"majority":"Strict majority", "weighted":"Weighted score",
-                                           "and":"AND (unanimous)", "or":"OR (no conflict)"}.get)
-        threshold = st.number_input("Weighted score threshold", min_value=0., max_value=1.,
-                                    value=float(combination["threshold"]), step=.05)
-        st.caption("Weights and threshold apply only to Weighted score. Flat votes count toward the denominator. Opposing votes offset one another in the weighted score; OR goes flat on any conflict.")
-
-        st.subheader("Execution and risk")
-        a, b = st.columns(2)
-        capital = a.number_input("Starting capital", min_value=0., value=float(risk["initial_capital"]))
-        sizing = b.selectbox("Position sizing", ("fixed", "atr_risk"), index=int(risk["sizing"] == "atr_risk"),
-                             format_func={"fixed":"Fixed fraction", "atr_risk":"ATR risk"}.get)
-        fraction = a.number_input("Fixed allocation (%)", 0., 100., float(risk["fraction"])*100)
-        risk_pct = b.number_input("Risk at stop (%)", 0., 100., float(risk["risk_fraction"])*100)
-        exposure = a.number_input("Maximum exposure (%)", 0., 100., float(risk["max_exposure"])*100)
-        fee = a.number_input("Research fee per side (%)", 0., 100., float(risk["fee"])*100, step=.01, format="%.4f")
-        slippage = b.number_input("Research slippage per side (%)", 0., 100., float(risk["slippage"])*100, step=.01, format="%.4f")
-        use_stop = a.checkbox("Enable stop-loss", value=risk["stop_atr"] is not None)
-        stop = a.number_input("Stop distance (ATR multiples)", min_value=0., value=float(risk["stop_atr"] or 2.))
-        use_target = b.checkbox("Enable take-profit", value=risk["target_atr"] is not None)
-        target = b.number_input("Target distance (ATR multiples)", min_value=0., value=float(risk["target_atr"] or 3.))
-        submit = st.form_submit_button("Validate research settings", type="primary")
-
-    key = "validated_research_settings"
-    if submit:
-        options = {
-            "sma_trend": dict(rule="sma_trend", window=sma_window, weight=sma_weight),
-            "bollinger_reentry": dict(rule="bollinger_reentry", window=bb_window, weight=bb_weight, deviations=bb_width),
-        }
-        try:
-            validated = validate_config(dict(
-                version=1, name=name, provider=provider, components=[options[rule] for rule in rules],
-                combination=dict(method=method, threshold=threshold),
-                execution=dict(initial_capital=capital, sizing=sizing, fraction=fraction/100,
-                               risk_fraction=risk_pct/100, max_exposure=exposure/100,
-                               fee=fee/100, slippage=slippage/100,
-                               stop_atr=stop if use_stop else None, target_atr=target if use_target else None),
-            ))
-        except ValueError as exc:
-            st.session_state.pop(key, None)
-            st.error(str(exc))
-        else:
-            st.session_state[key] = (source, validated)
-    saved = st.session_state.get(key)
-    if saved and saved[0] == source:
-        st.success("Settings validated. Download to save this version.")
-        output = json.dumps(saved[1], indent=2) + "\n"
-        st.download_button("Download research config", output, file_name="research_strategy.json",
-                           mime="application/json")
-        with st.expander("Validated JSON"):
-            st.code(output, language="json")
-
-    if saved and saved[0] == source:
-        return saved[1], True
-    return defaults, False
+    st.success(f"{len(configs)} strategies validated.")
+    st.dataframe(pd.DataFrame([
+        {"Strategy": cfg["name"], "Indicator": c["indicator_name"], "Number": c["indicator_number"],
+         "Category": c.get("category", ""),
+         "Timeframes": "Intraday" if is_intraday_strategy(cfg) else "All", "Direction": cfg.get("trade_direction", "both"), "Rule": c["rule"], "Parameters": ", ".join(f"{k}={v}" for k,v in c.items()
+             if k not in ("rule","indicator_name","indicator_number","weight","category")),
+         "Weight": c["weight"], "Combination": cfg["combination"]["method"],
+         "Threshold": cfg["combination"]["threshold"] if cfg["combination"]["method"]=="weighted" else None}
+        for cfg in configs for c in cfg["components"]
+    ]), hide_index=True, width="stretch")
+    if any(is_intraday_strategy(cfg) for cfg in configs):
+        st.caption("UTC-session VWAP uses intraday OHLCV. Daily runs list that strategy as skipped.")
+    for cfg in configs:
+        if duplicate_signal_count(cfg):
+            st.warning(f"{cfg['name']}: multiple votes use identical rule parameters.")
+    filters = [{"Strategy": cfg["name"], **item}
+               for cfg in configs for item in cfg.get("entry_filters", [])]
+    if filters:
+        with st.expander("Entry-only filters"):
+            st.dataframe(pd.DataFrame(filters), hide_index=True, width="stretch")
+    with st.expander("Resolved execution settings"):
+        st.dataframe(pd.DataFrame([{"Strategy": c["name"], **c["execution"]} for c in configs]),
+                     hide_index=True, width="stretch")
+    return configs
 
 
-def _research_batch_controls(strategy, *, using_validated):
-    """Run the same provider/asset/timeframe selection as the research CLI."""
+def _research_batch_controls(strategies):
+    """Run selected workbook strategies against stored SQLite candles."""
     import sqlite3
     from research_lab.data import open_ohlcv, stored_pairs
-    from research_lab.runner import BASELINE_CONFIG, run_batch
+    from research_lab.runner import RUNS_DIR, run_batch, run_split, shared_warmup, strategy_directions
 
     st.subheader("Run research batch")
-    provider = strategy["provider"]
-    source = "last validated settings" if using_validated else "loaded config"
-    st.caption(f"Using {source}: {strategy['name']} ({provider}). "
-               "Validate research settings in the Settings tab to apply any form edits. Results are historical only.")
+    by_name = {c["name"]: c for c in strategies}
+    names = st.multiselect("Batch strategies", list(by_name), default=list(by_name))
+    if not names:
+        st.info("Select at least one strategy.")
+        return
+    configs = [by_name[name] for name in names]
+    provider = configs[0]["provider"]
+    st.caption(f"Using validated workbook: {len(configs)} strategies ({provider}). Directions follow the workbook; long and short runs use separate capital. Results are historical only.")
     try:
         with open_ohlcv(config.DB_PATH) as conn:
             pairs = stored_pairs(conn, provider)
@@ -660,22 +613,58 @@ def _research_batch_controls(strategy, *, using_validated):
     symbol = None if symbol_choice == all_symbols else symbol_choice
     count = sum((symbol is None or s == symbol) and (timeframe is None or t == timeframe)
                 for s, t in pairs)
-    st.caption(f"{count} stored asset/timeframe pairs selected. Buy-and-hold and SMA100 benchmarks are included.")
+    cost_groups = {tuple(c["execution"][key] for key in ("initial_capital","fee","slippage"))
+                   for c in configs}
+    warmup = shared_warmup(configs)
+    st.caption(f"Matched window: {warmup} completed candles of warmup, then common dates across eligible assets "
+               "within each timeframe. Full history: each strategy starts when its own inputs are ready. "
+               "Both views are saved separately.")
 
+    history_policy = st.selectbox(
+        "History with missing candles",
+        ["Strict audit", "Latest continuous history", "Carry forward confirmed empty candles"],
+        index=2,
+        help="Latest continuous history starts after the last gap in each asset and timeframe. "
+             "Warmup restarts there. Carry forward uses the previous close and zero volume "
+             "for confirmed empty intervals, with trade execution blocked on those candles. "
+             "Other data audit checks still apply. "
+             "For a date split, each period uses the candles available at its own cutoff.")
+    evaluation_start = st.date_input(
+        "Evaluation start (UTC, optional)", value=None, disabled=timeframe != "1d",
+        help="For daily candles, split into development and historical evaluation. Both start flat.")
+    if timeframe != "1d":
+        evaluation_start = None
+    if evaluation_start:
+        st.info("The date is the first evaluation open. The same strategies run in both periods; "
+                "this is historical evaluation, not an untouched forward test.")
+    runs = 4 if evaluation_start else 2
+    directional_count = sum(len(strategy_directions(cfg)) for cfg in configs)
+    st.caption(f"{directional_count} directional strategies × {count} asset/timeframe pairs × {runs} saved views "
+               f"= {directional_count*count*runs} planned strategy simulations. "
+               f"{2*len(cost_groups)*count*runs} benchmark simulations are also planned.")
     if st.button("Run research batch", type="primary"):
         progress = st.progress(0., text="Preparing research batch…")
         try:
-            folder, manifest = run_batch(
-                [strategy], config.DB_PATH, BASELINE_CONFIG.parents[1]/"research_runs",
-                symbol=symbol, timeframe=timeframe,
-                on_progress=lambda i,n,s,t: progress.progress(i/n,text=f"{i}/{n}: {s} / {t}"),
-            )
+            options = dict(symbol=symbol, timeframe=timeframe, both_views=True,
+                           latest_continuous=history_policy == "Latest continuous history",
+                           fill_confirmed_gaps=history_policy == "Carry forward confirmed empty candles",
+                           on_progress=lambda i,n,s,t: progress.progress(i/n,text=f"{i}/{n}: {s} / {t}"))
+            if evaluation_start:
+                saved = run_split(configs, config.DB_PATH, RUNS_DIR,
+                                  evaluation_start=evaluation_start, **options)
+            else:
+                saved = run_batch(configs, config.DB_PATH, RUNS_DIR, **options)
         except (ValueError, OSError, sqlite3.Error) as exc:
             st.error(f"Research batch failed: {exc}")
         else:
+            folder, manifest = saved[-1]
             st.session_state["last_research_batch"] = dict(
-                folder=str(folder), jobs=manifest["jobs"], name=strategy["name"],
+                folder=str(folder), jobs=manifest["jobs"], name=", ".join(c["name"] for c in configs),
                 provider=provider, symbol=symbol_choice, timeframe=chosen_interval,
+                views=[dict(folder=str(path),jobs=m["jobs"],
+                            label=" / ".join(part for part in
+                                (m.get("phase"),m["window_view"].replace("-"," ")) if part))
+                       for path,m in saved],
             )
         finally:
             progress.empty()
@@ -683,16 +672,29 @@ def _research_batch_controls(strategy, *, using_validated):
     last = st.session_state.get("last_research_batch")
     if last:
         from pathlib import Path
-        jobs = last["jobs"]
+        st.caption(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']}")
+        views = last.get("views")
+        selected = last
+        if views:
+            choice = st.selectbox("Batch result view", range(len(views)), index=len(views)-1,
+                                  format_func=lambda i: views[i]["label"])
+            selected = views[choice]
+        jobs = selected["jobs"]
         status = st.warning if jobs["failed"] or jobs["skipped"] else st.success
-        status(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']} — "
-               f"{jobs['completed']} completed, {jobs['skipped']} skipped, {jobs['failed']} failed.")
-        st.code(last["folder"], language=None)
+        status(f"{jobs['completed']} completed, {jobs['skipped']} skipped, {jobs['failed']} failed.")
+        st.code(selected["folder"], language=None)
         try:
-            results = (Path(last["folder"])/"results.csv").read_bytes()
+            results = (Path(selected["folder"])/"results.csv").read_bytes()
             from io import BytesIO
-            st.dataframe(pd.read_csv(BytesIO(results), dtype={"symbol": str}, keep_default_na=False),
-                         hide_index=True, width="stretch")
+            # Blank metrics on skipped runs must still have a numeric column type.
+            numeric_types = {
+                "strategy_number": "Int64", "warmup_candles": "Int64", "execution_candles": "Int64",
+                "synthetic_candles_used": "Int64", "synthetic_candles_in_test_window": "Int64",
+                "trades": "Int64", "final_equity": "Float64", "total_return_pct": "Float64",
+            }
+            frame = pd.read_csv(BytesIO(results), dtype={"symbol": str, **numeric_types},
+                                keep_default_na=False, na_values={key: [""] for key in numeric_types})
+            st.dataframe(frame, hide_index=True, width="stretch")
             st.download_button("Download batch results", results, file_name="results.csv", mime="text/csv")
         except OSError as exc:
             st.warning(f"Unable to read saved results: {exc}")

@@ -44,7 +44,8 @@ TRADE_COLUMNS = [
 ]
 
 
-def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution()):
+def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution(),
+             entry_allowed=None, prior_signal=0):
     """Simulate one long/short target-state strategy, without funding or borrowing.
 
     Signals are -1 (short), 0 (flat) or +1 (long), known at candle close.
@@ -95,10 +96,36 @@ def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution())
                            equity_after=capital))
         position = None
 
+    if prior_signal not in (-1, 0, 1):
+        raise ValueError("Prior signal must be -1, 0 or 1")
+    if entry_allowed is not None:
+        if not entry_allowed.index.equals(index) or not pd.api.types.is_bool_dtype(entry_allowed) or entry_allowed.isna().any():
+            raise ValueError("Entry filter must contain boolean values aligned to candles")
+        allowed = entry_allowed.to_numpy(dtype=bool)
+    else:
+        allowed = np.ones(len(index), dtype=bool)
+
+    synthetic = candles["synthetic"] if "synthetic" in candles else pd.Series(False, index=index)
+    if not pd.api.types.is_bool_dtype(synthetic) or synthetic.isna().any():
+        raise ValueError("Synthetic candle markers must be boolean")
+    synthetic = synthetic.to_numpy(dtype=bool)
+    real = np.flatnonzero(~synthetic)
+    last_real = real[-1] if real.size else -1
+    previous = pending = prior_signal
+    signal_at = 0
     for i in range(len(index)):
-        # At open i, only the completed signal and ATR from i-1 are available.
+        # Keep the signal, filter and ATR snapshot while the open is untradable.
         desired = states[i-1] if i else 0
-        previous = states[i-2] if i >= 2 else 0
+        if i and desired != pending:
+            pending, signal_at = desired, i-1
+        if synthetic[i]:
+            # The carried close marks an existing position. It cannot fill any order.
+            equity = capital
+            if position is not None:
+                _, gross, fees = value_at(c[i])
+                equity += gross - fees
+            marks.append(equity)
+            continue
         if position is not None:
             side, stop, target = position["side"], position["stop"], position["target"]
             if stop is not None and side * (o[i]-stop) <= 0:
@@ -109,9 +136,9 @@ def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution())
                 exit_trade(i, o[i], "signal_exit", "open")
         if capital <= 0:
             raise ValueError("Collateral exhausted; venue liquidation is not modelled")
-        if position is None and desired and desired != previous:
+        if position is None and desired and desired != previous and allowed[signal_at]:
             entry = o[i] * (1 + desired * slip)
-            known_atr = atr_values[i-1]
+            known_atr = atr_values[signal_at]
             if (settings.stop_atr is not None or settings.target_atr is not None) and (
                     not np.isfinite(known_atr) or known_atr <= 0):
                 raise ValueError(f"Entry at {index[i]} requires positive ATR from the signal candle")
@@ -126,7 +153,7 @@ def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution())
                 stop_fill = stop * (1 - desired * slip)
                 loss_per_unit = desired * (entry - stop_fill) + fee * (entry + stop_fill)
                 quantity = min(quantity, capital * settings.risk_fraction / loss_per_unit)
-            position = dict(signal_candle=index[i-1], entry_candle=index[i], side=int(desired),
+            position = dict(signal_candle=index[signal_at], entry_candle=index[i], side=int(desired),
                             quantity=quantity, entry_fill=entry, stop=stop, target=target)
             # A very tight stop can already be breached at the raw open after entry slippage.
             if stop is not None and desired * (o[i]-stop) <= 0:
@@ -139,7 +166,7 @@ def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution())
                 exit_trade(i, stop, "stop", "intrabar")
             elif target is not None and side * (favourable-target) >= 0:
                 exit_trade(i, target, "target", "intrabar")
-            elif i == len(index)-1:
+            elif i == last_real:
                 exit_trade(i, c[i], "end_of_data", "close")
         equity = capital
         if position is not None:
@@ -148,6 +175,8 @@ def simulate(candles, signal, atr=None, *, timeframe="1d", settings=Execution())
         if equity <= 0:
             raise ValueError("Collateral exhausted; venue liquidation is not modelled")
         marks.append(equity)
+        if i:
+            previous = desired
 
     return dict(trades=pd.DataFrame(trades, columns=TRADE_COLUMNS),
                 equity=pd.Series(marks, index=index, name="equity"))

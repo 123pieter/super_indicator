@@ -240,3 +240,68 @@ The list defaults to the sidebar timeframe. Fetches run sequentially for each
 provider and timeframe combination, with separate progress and results. The pair
 limit applies to each combination, and exclusion settings remain provider-specific.
 The sidebar timeframe still controls analysis.
+
+## Research lab
+
+Edit the project workbook in the research_configs folder. Its **User Manual**
+explains how to define indicator instances and combine them into strategies.
+In Streamlit, open **Research lab → Settings** to preview the project workbook
+or upload another workbook, then choose what to run under **Run batch**.
+
+From the project PowerShell terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m research_lab check-workbook --provider hyperliquid
+.\.venv\Scripts\python.exe -B -m research_lab run-batch --provider hyperliquid --symbol AAVE --timeframe 1d
+```
+
+Use **--workbook** to select another workbook and repeat **--strategy-name**
+to select specific strategies. Saved runs keep their manifests so their reports
+can be opened independently of later workbook edits.
+
+### Donchian breakout
+
+Register an indicator instance in the workbook using the function key
+`donchian_breakout`. Optional parameter rows are `entry_window` (default 55)
+and `exit_window` (default 20), both in candles and at least 2. Use a new
+indicator number and link it to a strategy in the strategy_components sheet.
+
+A close above the highest high (below the lowest low) of the prior entry
+channel signals long (short). A close beyond the opposite exit channel
+signals flat, with no same-candle reversal. The signal candle does not
+contribute to either channel. Execution is at the next candle open;
+configured ATR stops and targets still apply.
+
+
+Research batches run each selected strategy twice: long only and short only.
+Each direction starts with its own capital, and an opposite signal is treated
+as cash. Reports show separate directional trade logs and equity curves.
+Buy-and-hold and SMA100 long/cash remain long-side benchmarks.
+
+### Donchian filter comparison
+
+Select **D0–D3** together under **Research lab → Run batch**. The variants
+share Donchian 40/20, sizing, costs and exits. Filters in the optional
+**strategy_entry_filters** sheet are ANDed at the signal close. A rejected
+transition is not retried when filters later pass, and filters never exit a trade.
+
+For daily candles, **Evaluation start (UTC)** (CLI: **--evaluation-start YYYY-MM-DD**)
+creates separate development and evaluation runs from one SQLite read snapshot.
+Both use the same frozen settings and start with independent capital. The
+evaluation needs a candle exactly at the boundary and sufficient prior warmup.
+A pre-boundary signal state is not treated as a fresh entry. The benchmarks
+initialize from the boundary, using only information already available.
+Open either phase in **Reports**. Historical evaluation is not an untouched forward test.
+
+### Research batch windows
+
+The app and batch command save two views. **Full history** uses each strategy's
+own indicator, filter and risk warmup; use it to inspect an individual history.
+**Matched window** reruns all included strategies and benchmarks on common
+execution dates across eligible assets within each timeframe. Strategies start
+flat and a state already active before the boundary is not a fresh entry.
+An asset can have a valid full-history result while being skipped in the matched
+view. Dates, warmup and execution candle counts are included in the output.
+
+When a daily split is set, each period saves both views. Pick the table using
+**Batch result view**, or select a saved folder under **Reports**.
