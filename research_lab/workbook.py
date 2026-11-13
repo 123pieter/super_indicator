@@ -1,5 +1,6 @@
 """Read explicit strategy combinations from an Excel workbook."""
 from dataclasses import fields
+from itertools import product
 from pathlib import Path
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
@@ -9,6 +10,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 from .engine import Execution
 from .filters import validate_filters
+from .rules import REGISTRY
 from .runner import validate_component, validate_config
 
 WORKBOOK_PATH = Path(__file__).resolve().parents[1]/"research_configs"/"strategies_config.xlsx"
@@ -80,7 +82,7 @@ def _resolve(book, provider):
             indicators[number]["category"] = _text(row,"category",where)
         locations[number] = where
         parameter_rows[number] = []
-    seen = set()
+    seen, sweeps = set(), {}
     for where, row in _rows(book, "individual_indicator_settings",
                             ("indicator_number","setting","value"), ("indicator_name",)):
         number = _id(row,"indicator_number",where)
@@ -92,7 +94,20 @@ def _resolve(book, provider):
         if "value" not in row:
             raise ValueError(f"{where}: value is required")
         seen.add((number,key))
-        indicators[number][key] = row["value"]
+        value = row["value"]
+        if isinstance(value, str) and "," in value:
+            rule = REGISTRY.get(indicators[number]["rule"])
+            parameter = rule.parameters.get(key) if rule else None
+            if parameter is None:
+                raise ValueError(f"{where}: unknown indicator parameter {key!r}")
+            convert = int if type(parameter.default) is int else float
+            try:
+                values = tuple(dict.fromkeys(convert(v.strip()) for v in value.split(",")))
+            except ValueError as exc:
+                raise ValueError(f"{where}: enter comma-separated numeric values for {key}") from exc
+            value = values[0]
+            sweeps.setdefault(number, {})[key] = (values, where)
+        indicators[number][key] = value
         parameter_rows[number].append(where)
     for number, indicator in indicators.items():
         try:
@@ -101,11 +116,11 @@ def _resolve(book, provider):
             rows = ", ".join(parameter_rows[number])
             raise ValueError(f"{locations[number]}{'; '+rows if rows else ''}: {exc}") from exc
 
-    strategies, strategy_rows = {}, {}
+    strategies, strategy_rows, signal_modes = {}, {}, {}
     names = set()
     for where, row in _rows(book, "strategies",
                             ("strategy_number","strategy_name","combination_rule","weighted_score_threshold"),
-                            (*EXECUTION_KEYS, "trade_direction"), display_only=("Entry filters",)):
+                            (*EXECUTION_KEYS, "trade_direction", "signal_mode"), display_only=("Entry filters",)):
         number = _id(row,"strategy_number",where)
         name = _text(row,"strategy_name",where)
         if number in strategies or name in names:
@@ -127,6 +142,10 @@ def _resolve(book, provider):
                                   combination=combination, execution=execution)
         if "trade_direction" in row:
             strategies[number]["trade_direction"] = _text(row,"trade_direction",where)
+        mode = row.get("signal_mode", "normal")
+        if not isinstance(mode, str) or mode.strip().lower() not in ("normal", "inverted", "both"):
+            raise ValueError(f"{where}: signal_mode must be normal, inverted, or both")
+        signal_modes[number] = mode.strip().lower()
         strategy_rows[number] = where
 
     members = set()
@@ -158,9 +177,36 @@ def _resolve(book, provider):
     if not strategies:
         raise ValueError("strategies: add at least one strategy")
     configs = []
+    resolved_names = set()
     for number, strategy in strategies.items():
-        try:
-            configs.append(validate_config(strategy))
-        except ValueError as exc:
-            raise ValueError(f"{strategy_rows[number]}: {exc}") from exc
+        where = strategy_rows[number]
+        for cfg in _variants(strategy, signal_modes[number], sweeps, where):
+            if cfg["name"] in resolved_names:
+                raise ValueError(f"{where}: duplicate generated strategy name {cfg['name']!r}")
+            resolved_names.add(cfg["name"])
+            configs.append(cfg)
     return configs
+
+
+def _variants(strategy, mode, sweeps, where):
+    """Expand workbook parameter lists and signal modes using the runner's validation."""
+    axes = [
+        (index, key, values, location)
+        for index, component in enumerate(strategy["components"])
+        for key, (values, location) in sweeps.get(component["indicator_number"], {}).items()
+    ]
+    for values in product(*(axis[2] for axis in axes)):
+        components = [dict(component) for component in strategy["components"]]
+        labels = []
+        for (index, key, _, _), value in zip(axes, values):
+            components[index][key] = value
+            labels.append(f"{components[index]['indicator_number']}.{key}={value}")
+        for invert in ((False, True) if mode == "both" else (mode == "inverted",)):
+            tags = labels + (["Inverted" if invert else "Normal"] if mode != "normal" else [])
+            name = f"{strategy['name']} [{', '.join(tags)}]" if tags else strategy["name"]
+            try:
+                yield validate_config(dict(strategy, name=name, components=components, invert_signal=invert))
+            except ValueError as exc:
+                sources = ", ".join(dict.fromkeys(axis[3] for axis in axes))
+                context = f"{where}, {sources}" if sources else where
+                raise ValueError(f"{context}: {name}: {exc}") from exc

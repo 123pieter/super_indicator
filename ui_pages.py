@@ -259,7 +259,7 @@ def fetch_policy(provider):
     return policy
 
 
-def fetch_provider(provider, timeframe, limit, retry_excluded, force_refresh, progress, position, total):
+def fetch_provider(provider, timeframe, limit, retry_excluded, force_refresh, progress, position, total, only_symbols=()):
     """Run one provider/timeframe combination independently, including setup failures."""
     from fetch_data import main
 
@@ -280,8 +280,9 @@ def fetch_provider(provider, timeframe, limit, retry_excluded, force_refresh, pr
             summary = event
 
     try:
+        scope = {"only_symbols": only_symbols} if only_symbols else {}
         main(limit=limit, timeframe=timeframe, on_progress=update,
-             ignore_exclusions=retry_excluded, force_refresh=force_refresh, provider=provider)
+             ignore_exclusions=retry_excluded, force_refresh=force_refresh, provider=provider, **scope)
     except Exception as exc:
         error = str(exc)
     key = (provider, timeframe)
@@ -299,6 +300,10 @@ def data_management():
     st.title("Data management")
     st.caption(f"Inspecting {config.LOAD_FROM.upper()} | Fetch destination: {config.SAVE_TO} | Providers: {', '.join(providers)}")
     policies = {provider: fetch_policy(provider) for provider in providers}
+    if "binance" in providers:
+        st.caption("Binance uses USDT-margined perpetual trade candles. If public REST is unavailable, "
+                   "the published archive is used for the configured BTC, ETH and SOL markets. "
+                   "The latest completed day may still be awaiting publication.")
     if "hyperliquid" in providers:
         st.info("Hyperliquid supplies perpetual-market candles without an API key. Only the most recent 5,000 candles per coin/timeframe are available; shorter history can limit analysis.")
     with st.container(border=True):
@@ -312,6 +317,9 @@ def data_management():
         if not jobs:
             st.info("Select at least one timeframe to fetch.")
         limit = st.number_input("Pairs to fetch (0 = all)", min_value=0, value=config.FETCH_LIMIT or 0, step=1)
+        requested = st.text_input("Fetch only these symbols (optional)", placeholder="BTC, ETH, SOL",
+                                  help="Comma or space separated. Leave blank for the usual provider universe.")
+        only_symbols = requested.replace(",", " ").split()
         st.caption("The limit applies per provider and timeframe and counts only outdated eligible coins. Current coins use local data; discovery is cached until the next UTC day. Provider access and rate limits apply.")
         force_refresh = st.checkbox("Force refresh", help="Refresh coin discovery and request candles even when current. Exclusions still apply unless Retry previously excluded coins is also selected.")
         retry_excluded = st.checkbox("Retry previously excluded coins this run", help="Temporarily bypass both rules without changing the saved settings.")
@@ -322,7 +330,7 @@ def data_management():
                 for position, (provider, interval) in enumerate(jobs, 1):
                     reports[(provider, interval)] = fetch_provider(
                         provider, interval, int(limit), retry_excluded, force_refresh,
-                        progress, position, len(jobs))
+                        progress, position, len(jobs), only_symbols)
             finally:
                 progress.empty()
                 candles.clear()
@@ -371,6 +379,23 @@ def data_management():
     c.metric("Stored candles", int(frame["Stored bars"].sum()))
     st.dataframe(frame, hide_index=True, width="stretch")
     st.caption("Timestamps are UTC candle starts. Staleness counts expected completed intervals since the latest candle; it does not prove that earlier history has no gaps.")
+    funding_providers = tuple(p for p in providers if p in ("hyperliquid", "binance"))
+    if funding_providers:
+        import sqlite3
+        from research_lab.data import open_ohlcv
+        from research_lab.funding import funding_coverage
+        with st.expander("Stored funding coverage"):
+            try:
+                with open_ohlcv(config.DB_PATH) as conn:
+                    rates = funding_coverage(conn, funding_providers)
+            except (ValueError, OSError, sqlite3.Error):
+                rates = pd.DataFrame()
+            if rates.empty:
+                st.info("No historical funding rates stored for this provider.")
+            else:
+                st.dataframe(rates, hide_index=True, width="stretch")
+            st.caption("These are settlement timestamps. Coverage can have gaps between them. "
+                       "Fetch / Update data updates candles. Research Lab checks funding continuity before each funded run.")
 
 
 def indicator_backtest():
@@ -520,40 +545,37 @@ def indicator_backtest():
     st.caption("These are in-sample experiments, not proof of predictive value. No candidate is selected automatically. Funding, borrow costs, liquidity limits and venue liquidation rules are excluded. Experiments that exhaust short capital are marked unavailable; losses are never clipped. Drawdown uses candle closes and excludes intrabar extremes. Positions close at the end of the test.")
 
 def research_settings():
-    """Keep strategy editing, batch execution, and saved reports in separate tabs."""
-    from research_lab.runner import RUNS_DIR
+    """Load workbook strategies and run batches."""
 
     st.title("Research lab")
-    settings_tab, batch_tab, reports_tab = st.tabs(["Settings", "Run batch", "Reports"])
+    provider = st.selectbox("Research data provider", PROVIDERS, key="research_workbook_provider")
+    settings_tab, batch_tab = st.tabs(["Settings", "Run batch"])
     with settings_tab:
-        configs = _research_workbook_form()
+        configs = _research_workbook_form(provider)
     with batch_tab:
-        if configs is None:
-            st.info("Open a valid strategy workbook in Settings before starting a batch.")
-        else:
+        if configs:
             _research_batch_controls(configs)
-    with reports_tab:
-        _research_reports(RUNS_DIR)
+        else:
+            st.info("Open a valid strategy workbook in Settings before starting a batch.")
 
 
-def _research_workbook_form():
+def _research_workbook_form(provider):
     """Preview a project workbook or an uploaded copy without running it."""
     from research_lab.runner import duplicate_signal_count, is_intraday_strategy
     from research_lab.workbook import WORKBOOK_PATH, load_workbook_configs
 
     upload = st.file_uploader("Upload a strategy workbook (optional)", type=["xlsx"],
                               key="research_workbook")
-    provider = st.selectbox("Workbook data provider", PROVIDERS, key="research_workbook_provider")
     st.caption("Without an upload, the app reads the project strategy workbook. Save your Excel changes before previewing.")
     try:
         configs = load_workbook_configs(upload or WORKBOOK_PATH, provider)
     except (ValueError, OSError) as exc:
-        st.error(f"Workbook validation failed: {exc}")
-        return
+        st.warning(f"Workbook validation failed: {exc}")
+        return []
     st.success(f"{len(configs)} strategies validated.")
     st.dataframe(pd.DataFrame([
         {"Strategy": cfg["name"], "Indicator": c["indicator_name"], "Number": c["indicator_number"],
-         "Category": c.get("category", ""),
+         "Category": c.get("category", ""), "Signals": "Inverted" if cfg.get("invert_signal") else "Normal",
          "Timeframes": "Intraday" if is_intraday_strategy(cfg) else "All", "Direction": cfg.get("trade_direction", "both"), "Rule": c["rule"], "Parameters": ", ".join(f"{k}={v}" for k,v in c.items()
              if k not in ("rule","indicator_name","indicator_number","weight","category")),
          "Weight": c["weight"], "Combination": cfg["combination"]["method"],
@@ -565,11 +587,32 @@ def _research_workbook_form():
     for cfg in configs:
         if duplicate_signal_count(cfg):
             st.warning(f"{cfg['name']}: multiple votes use identical rule parameters.")
-    filters = [{"Strategy": cfg["name"], **item}
+    FILTER_HELP = {
+        "ema_alignment": "Close above EMA for longs and below it for shorts.",
+        "adx_strength": "ADX strictly above the threshold for either direction.",
+        "rsi_confirmation": "RSI above the threshold for longs and below it for shorts.",
+        "relative_volume": "Signal volume divided by average volume of the preceding candles must exceed the threshold.",
+        "bollinger_compression": "Previous candle's band width percentile at or below the threshold.",
+        "low_choppiness": "Choppiness Index at or below the threshold.",
+        "high_trend_efficiency": "Net close movement as a percent of total absolute close movement, at or above the threshold.",
+        "low_trend_efficiency": "Net close movement as a percent of total absolute close movement, at or below the threshold.",
+        "low_realized_volatility": "Current realized volatility percentile at or below the threshold, ranked against the previous five lookback windows.",
+    }
+    filters = [{"Strategy": cfg["name"], **item,
+                "What it checks": FILTER_HELP[item["filter_rule"]]}
                for cfg in configs for item in cfg.get("entry_filters", [])]
     if filters:
         with st.expander("Entry-only filters"):
+            st.caption("All listed filters must pass on the signal candle. They gate new entries and leave exits to the strategy and execution settings.")
             st.dataframe(pd.DataFrame(filters), hide_index=True, width="stretch")
+    if any(c["rule"] == "atr_pullback" for cfg in configs for c in cfg["components"]):
+        with st.expander("How ATR pullback works"):
+            st.markdown(
+                "The rule measures the close's distance from the fast EMA in ATR units. "
+                "It enters after a pullback recovers through the configured distance while "
+                "price and the fast EMA remain on the trend side of the slow EMA. It exits "
+                "when price reaches the fast EMA or crosses the slow EMA against the trend."
+            )
     with st.expander("Resolved execution settings"):
         st.dataframe(pd.DataFrame([{"Strategy": c["name"], **c["execution"]} for c in configs]),
                      hide_index=True, width="stretch")
@@ -577,9 +620,10 @@ def _research_workbook_form():
 
 
 def _research_batch_controls(strategies):
-    """Run selected workbook strategies against stored SQLite candles."""
+    """Run the selected workbook configurations against stored candles."""
     import sqlite3
     from research_lab.data import open_ohlcv, stored_pairs
+    from research_lab.report import export_metrics
     from research_lab.runner import RUNS_DIR, run_batch, run_split, shared_warmup, strategy_directions
 
     st.subheader("Run research batch")
@@ -590,7 +634,7 @@ def _research_batch_controls(strategies):
         return
     configs = [by_name[name] for name in names]
     provider = configs[0]["provider"]
-    st.caption(f"Using validated workbook: {len(configs)} strategies ({provider}). Directions follow the workbook; long and short runs use separate capital. Results are historical only.")
+    st.caption(f"{len(configs):,} workbook configurations for {provider}. Long and short runs use separate capital.")
     try:
         with open_ohlcv(config.DB_PATH) as conn:
             pairs = stored_pairs(conn, provider)
@@ -611,13 +655,29 @@ def _research_batch_controls(strategies):
     symbol_choice = st.selectbox("Batch asset", [all_symbols, *symbols], index=1,
                                  key=f"research_batch_asset_{provider}_{chosen_interval}")
     symbol = None if symbol_choice == all_symbols else symbol_choice
+    coverage_on = None
+    if symbol is None:
+        coverage_on = st.date_input(
+            "Require stored coverage on (UTC, optional)", value=None, key=f"batch_coverage_{provider}",
+            help="Include only assets and timeframes with a stored candle on this date. "
+                 "For historical validation, use a date known before the evaluation period.")
+        if coverage_on is not None:
+            try:
+                with open_ohlcv(config.DB_PATH) as conn:
+                    pairs = stored_pairs(conn, provider, coverage_on=coverage_on)
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                st.error(f"Unable to check coverage date: {exc}")
+                return
     count = sum((symbol is None or s == symbol) and (timeframe is None or t == timeframe)
                 for s, t in pairs)
     cost_groups = {tuple(c["execution"][key] for key in ("initial_capital","fee","slippage"))
                    for c in configs}
-    warmup = shared_warmup(configs)
-    st.caption(f"Matched window: {warmup} completed candles of warmup, then common dates across eligible assets "
-               "within each timeframe. Full history: each strategy starts when its own inputs are ready. "
+    signal_delay_bars = st.number_input(
+        "Extra signal delay (candles)", min_value=0, value=0, step=1,
+        help="0 executes at the next open. 1 waits one additional candle for strategy entries and signal-driven exits.")
+    warmup = shared_warmup(configs) + signal_delay_bars
+    st.caption(f"Matched window: {warmup} completed candles of warmup, then common dates for the largest "
+               "overlapping asset group in each timeframe. Full history: each strategy starts when its own inputs are ready. "
                "Both views are saved separately.")
 
     history_policy = st.selectbox(
@@ -629,10 +689,29 @@ def _research_batch_controls(strategies):
              "for confirmed empty intervals, with trade execution blocked on those candles. "
              "Other data audit checks still apply. "
              "For a date split, each period uses the candles available at its own cutoff.")
+    include_funding = False
+    execution_start = None
+    as_of = None
+    if provider in ("binance", "hyperliquid"):
+        st.caption("Zero-volume perpetual candles can mark positions but cannot fill orders.")
+        include_funding = st.checkbox(
+            "Include historical funding (estimated)", key=f"batch_funding_{provider}",
+            help="Use stored signed rates. Candle closes approximate the oracle notional. "
+                 "Runs with missing funding coverage are skipped. For a stop or target hit "
+                 "inside a candle, the model charges adverse funding for the full candle.")
+        if include_funding:
+            start_column, end_column = st.columns(2)
+            execution_start = start_column.date_input(
+                "Start executing on (UTC, optional)", value=None, key=f"funding_start_{provider}",
+                help="Indicators still warm up on earlier price candles. Set a date covered by funding.")
+            through = end_column.date_input(
+                "Backtest through (UTC, optional)", value=None, key=f"funding_end_{provider}",
+                help="Last included UTC date. Leave blank to use all completed stored price candles.")
+            as_of = pd.Timestamp(through, tz="UTC") + pd.Timedelta(days=1) if through else None
     evaluation_start = st.date_input(
-        "Evaluation start (UTC, optional)", value=None, disabled=timeframe != "1d",
-        help="For daily candles, split into development and historical evaluation. Both start flat.")
-    if timeframe != "1d":
+        "Evaluation start (UTC, optional)", value=None, disabled=timeframe is None,
+        help="Select one timeframe to split at UTC midnight. Development and evaluation each start flat.")
+    if timeframe is None:
         evaluation_start = None
     if evaluation_start:
         st.info("The date is the first evaluation open. The same strategies run in both periods; "
@@ -642,10 +721,16 @@ def _research_batch_controls(strategies):
     st.caption(f"{directional_count} directional strategies × {count} asset/timeframe pairs × {runs} saved views "
                f"= {directional_count*count*runs} planned strategy simulations. "
                f"{2*len(cost_groups)*count*runs} benchmark simulations are also planned.")
-    if st.button("Run research batch", type="primary"):
+    if not count:
+        st.info("No asset/timeframe pairs meet the selected coverage date.")
+    save_equity = st.checkbox("Save equity.csv", value=False,
+                              help="Keep the per-candle equity history in each run folder.")
+    if st.button("Run research batch", type="primary", disabled=not count):
         progress = st.progress(0., text="Preparing research batch…")
         try:
-            options = dict(symbol=symbol, timeframe=timeframe, both_views=True,
+            options = dict(symbol=symbol, timeframe=timeframe, both_views=True, coverage_on=coverage_on,
+                           execution_start=execution_start, include_funding=include_funding, as_of=as_of,
+                           signal_delay_bars=signal_delay_bars,
                            latest_continuous=history_policy == "Latest continuous history",
                            fill_confirmed_gaps=history_policy == "Carry forward confirmed empty candles",
                            on_progress=lambda i,n,s,t: progress.progress(i/n,text=f"{i}/{n}: {s} / {t}"))
@@ -657,10 +742,16 @@ def _research_batch_controls(strategies):
         except (ValueError, OSError, sqlite3.Error) as exc:
             st.error(f"Research batch failed: {exc}")
         else:
+            for i, (path, _) in enumerate(saved, 1):
+                progress.progress(i / len(saved), text=f"Writing CSV exports {i} of {len(saved)}…")
+                try:
+                    export_metrics(path, save_equity=save_equity)
+                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+                    st.warning(f"Saved {path.name}. CSV export failed. {exc}")
             folder, manifest = saved[-1]
             st.session_state["last_research_batch"] = dict(
                 folder=str(folder), jobs=manifest["jobs"], name=", ".join(c["name"] for c in configs),
-                provider=provider, symbol=symbol_choice, timeframe=chosen_interval,
+                provider=provider, symbol=symbol_choice, timeframe=chosen_interval, signal_delay_bars=signal_delay_bars,
                 views=[dict(folder=str(path),jobs=m["jobs"],
                             label=" / ".join(part for part in
                                 (m.get("phase"),m["window_view"].replace("-"," ")) if part))
@@ -672,7 +763,8 @@ def _research_batch_controls(strategies):
     last = st.session_state.get("last_research_batch")
     if last:
         from pathlib import Path
-        st.caption(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']}")
+        st.caption(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']}"
+                   f" | Extra signal delay: {last.get('signal_delay_bars', 0)} candles")
         views = last.get("views")
         selected = last
         if views:
@@ -690,58 +782,16 @@ def _research_batch_controls(strategies):
             numeric_types = {
                 "strategy_number": "Int64", "warmup_candles": "Int64", "execution_candles": "Int64",
                 "synthetic_candles_used": "Int64", "synthetic_candles_in_test_window": "Int64",
-                "trades": "Int64", "final_equity": "Float64", "total_return_pct": "Float64",
+                "non_tradable_candles": "Int64",
+                "trades": "Int64", "final_equity": "Float64", "total_return_pct": "Float64", "funding_paid": "Float64",
             }
             frame = pd.read_csv(BytesIO(results), dtype={"symbol": str, **numeric_types},
                                 keep_default_na=False, na_values={key: [""] for key in numeric_types})
             st.dataframe(frame, hide_index=True, width="stretch")
             st.download_button("Download batch results", results, file_name="results.csv", mime="text/csv")
+            signals = Path(selected["folder"])/"latest_signals.csv"
+            if signals.is_file():
+                st.download_button("Download latest signals", signals.read_bytes(),
+                                   file_name=signals.name, mime="text/csv")
         except OSError as exc:
             st.warning(f"Unable to read saved results: {exc}")
-
-def _research_reports(root):
-    """Show saved, locally generated HTML reports without running a strategy."""
-    import sqlite3
-    from research_lab.report import generate_report
-
-    st.subheader("Saved research reports")
-    try:
-        root = root.resolve()
-        runs = {
-            folder.name: folder for folder in sorted(root.iterdir(), reverse=True)
-            if folder.is_dir() and folder.resolve().parent == root
-            and (folder/"manifest.json").is_file()
-        } if root.is_dir() else {}
-    except OSError as exc:
-        st.error(f"Unable to list research runs: {exc}")
-        return
-    if not runs:
-        st.info("Complete a research batch to view its report here.")
-        return
-    selected = st.selectbox("Saved research run", list(runs), key="saved_research_report")
-    folder = runs[selected]
-    path = folder/"report.html"
-    if path.resolve().parent != folder.resolve():
-        st.error("The report is outside its run folder.")
-        return
-    if not path.is_file():
-        st.info("This run has no HTML report yet. Generating it uses the saved results.")
-        if not st.button("Generate report", key=f"generate_research_report_{selected}"):
-            return
-        try:
-            with st.spinner("Building report from saved results…"):
-                generate_report(folder)
-        except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-            st.error(f"Unable to generate report: {exc}")
-            return
-    try:
-        html = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        st.error(f"Unable to open report: {exc}")
-        return
-    # Local sibling file links work when opening the file directly, not in srcdoc.
-    head, marker, tail = html.partition("<p><a href='metrics_per_asset.csv'>")
-    if marker and "</p>" in tail:
-        html = head + tail.split("</p>", 1)[1]
-    st.caption("Interactive view of the saved report. The original HTML and CSV files remain in the run folder.")
-    st.iframe(html, height=800)

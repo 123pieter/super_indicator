@@ -4,6 +4,7 @@ import unittest
 import tempfile
 from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
+from providers import PROVIDERS
 import analyze
 import config
 import fetch_data
@@ -200,7 +201,7 @@ class AppInteractionTests(unittest.TestCase):
         self.assertTrue(r["aggregate"].valid_coins.eq(2).all())
 
     def test_all_providers_fetch_continues_after_failure(self):
-        """One click attempts both providers for the same timeframe, even if Polygon fails."""
+        """One click attempts every provider for the same timeframe, even if Polygon fails."""
         def fake_fetch(provider, timeframe, on_progress, **options):
             self.assertEqual(timeframe, "1d")
             if provider == "polygon":
@@ -213,7 +214,7 @@ class AppInteractionTests(unittest.TestCase):
         with patch.object(fetch_data, "main", side_effect=fake_fetch) as fetch:
             next(b for b in app.button if b.label=="Fetch / Update data").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual([call.kwargs["provider"] for call in fetch.call_args_list], ["polygon", "hyperliquid"])
+        self.assertEqual([call.kwargs["provider"] for call in fetch.call_args_list], list(PROVIDERS))
         self.assertTrue(any("polygon" in e.value and "Missing credentials" in e.value for e in app.error))
         self.assertTrue(any("hyperliquid" in m.value and "1 succeeded" in m.value for m in app.success))
 
@@ -235,14 +236,16 @@ class AppInteractionTests(unittest.TestCase):
         app = self.page("data_management", provider="all")
         next(m for m in app.multiselect if m.label == "Timeframes to fetch").set_value(["1d", "1h"]).run()
         next(c for c in app.checkbox if c.label == "Force refresh").check().run()
+        next(w for w in app.text_input if w.label == "Fetch only these symbols (optional)").set_value("BTC, ETH").run()
         with patch.object(fetch_data, "main", side_effect=fake_fetch) as fetch:
             next(b for b in app.button if b.label == "Fetch / Update data").click().run()
         self.assertFalse(app.exception)
-        expected = [("polygon", "1d"), ("polygon", "1h"), ("hyperliquid", "1d"), ("hyperliquid", "1h")]
+        expected = [(provider, interval) for provider in PROVIDERS for interval in ("1d", "1h")]
         self.assertEqual([(c.kwargs["provider"], c.kwargs["timeframe"]) for c in fetch.call_args_list], expected)
         self.assertTrue(all(c.kwargs["force_refresh"] for c in fetch.call_args_list))
+        self.assertTrue(all(c.kwargs["only_symbols"] == ["BTC", "ETH"] for c in fetch.call_args_list))
         self.assertEqual(set(app.session_state["fetch_reports"]), set(expected))
-        self.assertEqual(len(app.success), 3)
+        self.assertEqual(len(app.success), len(expected) - 1)
         self.assertTrue(any("polygon / 1h" in e.value for e in app.error))
 
     def test_empty_fetch_timeframes_disable_fetch(self):

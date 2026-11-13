@@ -407,3 +407,94 @@ def williams_reentry(candles, period=14, lower=-80., upper=-20.):
     score = -100 * (high - candles.close) / span.where(span.gt(0))
     return _reentry(score, lower, upper, middle=-50)
 
+
+
+def bb_keltner_squeeze(candles, period=20, bb_deviations=2., kc_multiplier=1.5,
+                       breakout_window=20, squeeze_lookback=5):
+    """Trade a range breakout after prior compression; zero lookback removes that gate."""
+    close = candles.close
+    bb_middle = close.rolling(period).mean()
+    bb_radius = bb_deviations * close.rolling(period).std(ddof=1)
+    ema = ema_value(close, period)
+    kc_radius = kc_multiplier * _atr(candles, period)
+    compressed = (bb_middle - bb_radius).gt(ema - kc_radius) & (
+        bb_middle + bb_radius).lt(ema + kc_radius)
+    if squeeze_lookback:
+        recent = compressed.shift(fill_value=False).rolling(squeeze_lookback, min_periods=1).max().eq(1)
+    else:
+        recent = ema.shift().notna()
+
+    above = close.gt(candles.high.shift().rolling(breakout_window).max())
+    below = close.lt(candles.low.shift().rolling(breakout_window).min())
+    long_entry = recent & above & ~above.shift(fill_value=False)
+    short_entry = recent & below & ~below.shift(fill_value=False)
+    return _hold_states(long_entry, short_entry, close.le(ema), close.ge(ema)).rename("bb_keltner_squeeze")
+
+
+def adx_switch(candles, entry_window=40, exit_window=20, adx_period=14, adx_threshold=20.,
+               rsi_period=2, lower=10., upper=90.):
+    """Use ADX to choose a fresh entry; retain the entering rule through its exit."""
+    breakout = donchian_breakout(candles, entry_window, exit_window)
+    reversal = rsi_reentry(candles.close, rsi_period, lower, upper)
+    adx = dmi_values(candles, adx_period)[0]
+    fresh_breakout = breakout.ne(breakout.shift(fill_value=0))
+    fresh_reversal = reversal.ne(reversal.shift(fill_value=0))
+    trend = adx.gt(adx_threshold)
+    range_bound = adx.le(adx_threshold)
+    # Both the Donchian entry and exit windows must be ready to compare branches.
+    warmup = max(entry_window+1, exit_window+1, 2*adx_period, rsi_period+2)
+    state, active, states = 0, None, []
+    for i, (b, r, allow_breakout, allow_reversal) in enumerate(zip(
+            breakout, reversal, trend & fresh_breakout, range_bound & fresh_reversal)):
+        if active is not None:
+            branch_state = b if active == "breakout" else r
+            if branch_state != state:
+                state, active = 0, None
+        elif i >= warmup-1:
+            if allow_breakout and b:
+                state, active = b, "breakout"
+            elif allow_reversal and r:
+                state, active = r, "reversal"
+        states.append(state)
+    return pd.Series(states, index=candles.index, dtype="int8", name="adx_switch")
+
+
+def trend_efficiency(close, period=20):
+    """Absolute net move divided by the sum of absolute moves, on a 0–100 scale."""
+    _window(period)
+    travel = close.diff().abs().rolling(period).sum()
+    displacement = close.diff(period).abs()
+    return (100 * displacement / travel.where(travel.gt(0))).mask(travel.eq(0), 0.)
+
+
+def realized_volatility_percentile(close, period=20):
+    """Rank current log-return volatility against 5×period strictly earlier values."""
+    _window(period)
+    volatility = (close / close.shift()).map(math.log).rolling(period).std(ddof=1)
+
+    def midrank(values):
+        historical, current = values[:-1], values[-1]
+        return 100 * ((historical < current).mean() + .5 * (historical == current).mean())
+
+    return volatility.rolling(5 * period + 1).apply(midrank, raw=True)
+
+
+def atr_pullback(candles, fast_window=20, slow_window=100, atr_period=14, pullback_atr=1.):
+    """Trade a recovery from an ATR-normalized pullback in an established EMA trend.
+
+    Long entries require normalized close-to-fast-EMA distance to move from at
+    most -pullback_atr into (-pullback_atr, 0). Both the signal close and fast
+    EMA must be above the slow EMA. Exit when the close reaches the fast EMA
+    or breaks the slow EMA. Short entries and exits mirror these rules.
+    """
+    close = candles.close
+    fast = ema_value(close, fast_window)
+    slow = ema_value(close, slow_window)
+    atr = _atr(candles, atr_period)
+    distance = (close - fast) / atr.where(atr.gt(0))
+    prior = distance.shift()
+    buy = prior.le(-pullback_atr) & distance.gt(-pullback_atr) & distance.lt(0) & close.gt(slow) & fast.gt(slow)
+    sell = prior.ge(pullback_atr) & distance.lt(pullback_atr) & distance.gt(0) & close.lt(slow) & fast.lt(slow)
+    return _hold_states(buy, sell, close.ge(fast) | close.le(slow),
+                        close.le(fast) | close.ge(slow)).rename("atr_pullback")
+

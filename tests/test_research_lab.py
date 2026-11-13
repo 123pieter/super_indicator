@@ -38,6 +38,19 @@ class ResearchDataTests(unittest.TestCase):
         self.assertEqual(report.stored.tolist(), [1, 1])
         self.assertTrue(report.status.eq("ok").all())
 
+    def test_coverage_date_filters_archived_pairs(self):
+        """Require a stored UTC candle on the chosen date while keeping old markets in storage."""
+        from research_lab.data import stored_pairs
+
+        self.insert("2025-01-01", timeframe="1d", symbol="OLD")
+        self.insert("2025-01-01", timeframe="1d", symbol="BTC")
+        self.insert("2025-01-02 00:00:00", timeframe="1d", symbol="BTC")
+        self.insert("2025-01-02 23:00:00", timeframe="1h", symbol="ETH")
+        with open_ohlcv(self.db) as conn:
+            self.assertEqual(stored_pairs(conn,"polygon",coverage_on="2025-01-02"),
+                             [("BTC","1d"),("ETH","1h")])
+            self.assertIn(("OLD","1d"),stored_pairs(conn,"polygon"))
+
     def test_bad_rows_and_gaps_remain_visible(self):
         """Drop invalid, off-grid and duplicate candles; count internal gaps separately from lag."""
         for date in ("2025-01-01 00:00:00", "2025-01-01 04:00:00", "2025-01-01 01:00:00",
@@ -294,6 +307,25 @@ class ResearchConfigTests(unittest.TestCase):
             cfg["combination"]["method"] = "weighted"
             self.assertEqual(build_signal(close, cfg).tolist(), [1, 1, 1, -1, 0])
 
+    def test_inversion_flips_only_the_combined_signal(self):
+        """Normal and inverted strategies can share indicator states without changing flat signals."""
+        from research_lab.runner import build_signal, validate_config
+
+        cfg = dict(sample_strategy(), components=[dict(rule="sma_trend", window=2)])
+        close = pd.Series([100., 100., 110., 90., 90.])
+        cache = {}
+        normal = build_signal(close, cfg, cache=cache)
+        inverted = build_signal(close, dict(cfg, invert_signal=True), cache=cache)
+        pd.testing.assert_series_equal(inverted, -normal)
+        pd.testing.assert_series_equal(build_signal(close, cfg, cache=cache), normal)
+        self.assertEqual(inverted.tolist(), [0, 0, -1, 1, 0])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(validate_config(dict(cfg, invert_signal=False)), validate_config(cfg))
+        self.assertIs(validate_config(dict(cfg, invert_signal=True))["invert_signal"], True)
+        for invalid in (1, "false", None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "Invert signal"):
+                validate_config(dict(cfg, invert_signal=invalid))
+
     def test_config_rejects_unknown_rule_and_atr_risk_without_stop(self):
         """Typos and impossible risk sizing fail before any backtest is run."""
         from research_lab.runner import validate_config
@@ -355,6 +387,44 @@ class ResearchConfigTests(unittest.TestCase):
         self.assertTrue(macd_direction(pd.Series([100.] * 50)).eq(0).all())
 
 class ResearchBatchTests(unittest.TestCase):
+    def test_inverted_batch_preserves_filtered_trade_times(self):
+        """A filtered original long becomes a short with the same signal, entry, and exit bars."""
+        from unittest.mock import patch
+        from research_lab.runner import run_batch
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "prices.db"
+            dates = pd.date_range("2025-01-01", periods=108)
+            closes = [100.] * len(dates)
+            closes[101], closes[103] = 110., 90.
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute(SCHEMA)
+                conn.executemany("INSERT INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)", [
+                    ("hyperliquid", str(date), "BTC", "1d", close, close+1, close-1, close, 1)
+                    for date, close in zip(dates, closes)
+                ])
+            config = dict(sample_strategy(), components=[dict(rule="bollinger_reentry", window=2)],
+                          trade_direction="long", entry_filters=[dict(filter_rule="ema_alignment", period=2)],
+                          execution=dict(stop_atr=None, target_atr=None))
+            inverse = dict(config, name="Inverted", invert_signal=True)
+
+            def indicator(close, **params):
+                return close.isin((110., 90.)).astype("int8")
+
+            with patch.dict("research_lab.runner.RULES", {"bollinger_reentry": indicator}):
+                folder, manifest = run_batch([config, inverse], db, root / "runs", as_of="2026-01-01")
+            self.assertEqual(manifest["unique_strategy_settings"], 2)
+            inverse_cfg = next(exp["config"] for exp in manifest["experiments"] if exp["id"] == "strategy:2:short")
+            self.assertIs(inverse_cfg["invert_signal"], True)
+            trades = pd.read_csv(folder / "trades.csv")
+            strategy = trades[trades.experiment.str.startswith("strategy:")]
+            self.assertEqual(strategy.experiment.tolist(), ["strategy:1:long", "strategy:2:short"])
+            self.assertEqual(strategy.side.tolist(), [1, -1])
+            for column, index in (("signal_candle", 101), ("entry_candle", 102), ("exit_candle", 103)):
+                self.assertEqual(pd.to_datetime(strategy[column], utc=True).tolist(),
+                                 [dates[index].tz_localize("UTC")] * 2)
+
     def test_batch_covers_grid_and_preserves_failures(self):
         """Run both configs and benchmarks on each pair; report gaps without hiding jobs."""
         from research_lab.runner import run_batch
@@ -405,12 +475,8 @@ class ResearchBatchTests(unittest.TestCase):
             self.assertTrue(starts.eq(1000.).all())
             self.assertEqual(len(manifest["coverage"][0]["data_sha256"]),64)
             # The report keeps failed pairs visible but uses a matched universe per timeframe.
-            from research_lab.report import generate_report
-            html = generate_report(folder,symbol="AAA",timeframe="1d",experiment="strategy:1:long").read_text(encoding="utf-8")
-            self.assertIn("Inspect AAA / 1d",html)
-            self.assertIn("Stop-loss",html)
-            self.assertIn("Drawdown (%)",html)
-            self.assertNotIn("Price chart unavailable",html)
+            from research_lab.report import export_metrics
+            export_metrics(folder)
             per_asset = pd.read_csv(folder/"metrics_per_asset.csv")
             self.assertEqual(len(per_asset),18)
             overall = pd.read_csv(folder/"metrics_overall.csv")
@@ -423,19 +489,14 @@ class ResearchBatchTests(unittest.TestCase):
             vwap = dict(sample_strategy(), name="VWAP", components=[dict(rule="vwap_band_reentry")])
             _, (matched_folder, _) = run_batch([cfg, other, vwap], db, root/"runs",
                                               as_of="2026-01-01", both_views=True)
-            generate_report(matched_folder)
+            export_metrics(matched_folder, save_equity=False)
+            self.assertFalse((matched_folder/"equity.csv").exists())
             combined = pd.read_csv(matched_folder/"metrics_overall.csv")
             self.assertEqual(combined.groupby("timeframe").size().to_dict(), {"1d": 6, "1h": 8})
             self.assertEqual(set(combined.loc[combined.experiment.str.startswith("strategy:3:"), "timeframe"]), {"1h"})
             daily_details = pd.read_csv(matched_folder/"metrics_per_asset.csv")
             daily_details = daily_details[daily_details.timeframe.eq("1d") & daily_details.experiment.str.startswith("strategy:3:")]
             self.assertEqual(daily_details.status.tolist(), ["skipped", "skipped"])
-            # Altering a historical candle invalidates the price chart, not saved equity.
-            with closing(sqlite3.connect(db)) as conn, conn:
-                conn.execute("UPDATE ohlcv SET volume=2 WHERE symbol='AAA'")
-            changed = generate_report(folder,symbol="AAA",timeframe="1d").read_text(encoding="utf-8")
-            self.assertIn("differ from the recorded batch fingerprint",changed)
-
 
     def test_batch_rejects_mixed_providers_before_creating_outputs(self):
         """A comparison never combines Polygon and Hyperliquid prices in one batch."""
@@ -479,44 +540,111 @@ class ResearchReportTests(unittest.TestCase):
         self.assertEqual(m["exposure_pct"],100.)
         self.assertEqual(m["sample"],"thin")
 
-class ResearchReportUITests(unittest.TestCase):
-    def test_saved_report_is_embedded_and_missing_report_uses_artifacts(self):
-        """A saved report renders as HTML; generating another does not run a batch."""
-        from unittest.mock import patch
-        from streamlit.testing.v1 import AppTest
+class LatestSignalTests(unittest.TestCase):
+    def test_csv_exports_only_entries_from_newest_candle_across_coins(self):
+        """Discard stale entries and current exits, even when the newest coin has no entry."""
+        from research_lab.runner import run_batch
+
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name in ("20251101-first", "20251102-second"):
-                folder = root/name
-                folder.mkdir()
-                (folder/"manifest.json").write_text("{}", encoding="utf-8")
-            (root/"20251102-second"/"report.html").write_text(
-                "<!doctype html><h1>Saved report</h1>", encoding="utf-8")
+            db = root/"prices.db"
+            dates = pd.date_range(end="2026-11-09", periods=110)
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute(SCHEMA)
+                for asset, sample, last_prices in (
+                    ("AAA", dates[:-1], [100, 110]),
+                    ("BBB", dates, [110, 100]),
+                    ("CCC", dates, [100, 110]),
+                ):
+                    prices = [100]*(len(sample)-2) + last_prices
+                    conn.executemany("INSERT INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)", [
+                        ("hyperliquid", date.isoformat(), asset, "1d", price,
+                         price+1, price-1, price, 1)
+                        for date, price in zip(sample, prices)
+                    ])
+            cfg = dict(version=1, name="SMA", provider="hyperliquid", trade_direction="long",
+                       components=[dict(rule="sma_trend", window=2)],
+                       execution=dict(stop_atr=None, target_atr=None))
+            folder, _ = run_batch([cfg], db, root/"runs", as_of="2026-11-10")
+            entries = pd.read_csv(folder/"latest_signals.csv")
+            self.assertEqual(entries.symbol.tolist(), ["CCC"])
+            self.assertEqual(entries.event.tolist(), ["entry"])
+            self.assertEqual(pd.Timestamp(entries.signal_candle_utc.iloc[0]), pd.Timestamp("2026-11-09", tz="UTC"))
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute("DELETE FROM ohlcv WHERE symbol='CCC'")
+            folder, _ = run_batch([cfg], db, root/"runs", as_of="2026-11-10")
+            self.assertTrue(pd.read_csv(folder/"latest_signals.csv").empty)
 
-            def make_report(folder):
-                path = folder/"report.html"
-                path.write_text("<!doctype html><h1>Generated report</h1>", encoding="utf-8")
-                return path
+    def test_final_close_schedules_next_open_and_uses_signal_atr(self):
+        """A new state at the final close schedules an entry using its ATR."""
+        dates = pd.date_range("2026-11-07", periods=3, tz="UTC")
+        bars = pd.DataFrame(dict(open=100., high=101., low=99., close=100., volume=1.), index=dates)
+        result = simulate(bars, pd.Series([0, 0, 1], index=dates),
+                          pd.Series([1., 2., 3.], index=dates),
+                          settings=Execution(fee=0, slippage=0), preview_next_open=True)
+        order, = result["next_open_orders"]
+        self.assertEqual(order["signal_candle_utc"], dates[-1])
+        self.assertEqual(order["execution_candle_utc"], pd.Timestamp("2026-11-10", tz="UTC"))
+        self.assertEqual((order["action"], order["stop_loss"], order["take_profit"]), ("buy", 94., 109.))
+        self.assertTrue(result["trades"].empty)
 
-            script = (
-                f"from pathlib import Path\nfrom ui_pages import _research_reports\n"
-                f"_research_reports(Path({tmp!r}))"
-            )
-            with patch("research_lab.report.generate_report", side_effect=make_report) as generate, patch(
-                "research_lab.runner.run_batch"
-            ) as run:
-                app = AppTest.from_string(script).run()
-                self.assertIn("Saved report", app.get("iframe")[0].proto.srcdoc)
-                app.selectbox[0].select("20251101-first").run()
-                self.assertFalse(app.get("iframe"))
-                app.button[0].click().run()
-                self.assertIn("Generated report", app.get("iframe")[0].proto.srcdoc)
-                generate.assert_called_once_with(root/"20251101-first")
-                run.assert_not_called()
-            self.assertFalse(app.exception)
+    def test_forced_final_close_does_not_generate_a_sell_order(self):
+        """An existing long with a continuing signal remains open in the preview."""
+        dates = pd.date_range("2026-11-07", periods=3, tz="UTC")
+        bars = pd.DataFrame(dict(open=100., high=101., low=99., close=100., volume=1.), index=dates)
+        settings = Execution(stop_atr=None, target_atr=None)
+        for signal, expected in (([1, 1, 1], []), ([1, 1, 0], ["sell"])):
+            result = simulate(bars, pd.Series(signal, index=dates), settings=settings, preview_next_open=True)
+            self.assertEqual(result["trades"].reason.tolist(), ["end_of_data"])
+            self.assertEqual([x["action"] for x in result["next_open_orders"]], expected)
+
+
+    def test_preview_matches_backtest_reversal_at_next_open(self):
+        """Preview and replay agree on the next-open actions with or without entry permission."""
+        dates = pd.date_range("2026-11-07", periods=4, tz="UTC")
+        bars = pd.DataFrame(dict(open=100., high=101., low=99., close=100., volume=1.), index=dates)
+        signal = pd.Series([1, 1, -1, -1], index=dates)
+        atr = pd.Series(2., index=dates)
+        settings = Execution(fee=0, slippage=0)
+        for allow_short in (True, False):
+            gate = pd.Series([True, True, allow_short, True], index=dates)
+            history = (bars.iloc[:-1], signal.iloc[:-1], atr.iloc[:-1])
+            preview = simulate(*history, settings=settings, entry_allowed=gate.iloc[:-1], preview_next_open=True)
+            base = simulate(*history, settings=settings, entry_allowed=gate.iloc[:-1])
+            pd.testing.assert_frame_equal(preview["trades"], base["trades"])
+            pd.testing.assert_series_equal(preview["equity"], base["equity"])
+            replay = simulate(bars, signal, atr, settings=settings, entry_allowed=gate)["trades"]
+            orders = preview["next_open_orders"]
+            self.assertEqual([row["event"] for row in orders], ["exit", "entry"] if allow_short else ["exit"])
+            self.assertTrue(all(row["execution_candle_utc"] == dates[-1] for row in orders))
+            self.assertEqual(replay.iloc[0].reason, "signal_exit")
+            self.assertEqual(replay.iloc[0].exit_candle, dates[-1])
+            if allow_short:
+                self.assertEqual(replay.iloc[1].entry_candle, dates[-1])
+                self.assertEqual(orders[1]["stop_loss"], replay.iloc[1].stop)
+                self.assertEqual(orders[1]["take_profit"], replay.iloc[1].target)
+            else:
+                self.assertEqual(len(replay), 1)
+
+
+class MatchedCohortTests(unittest.TestCase):
+    def test_disjoint_delisted_history_does_not_empty_matched_window(self):
+        """Choose the common window of the largest group of eligible assets."""
+        from research_lab.runner import _matching_window
+
+        histories = {asset: tuple(pd.Timestamp(date) for date in window) for asset, window in {
+            "old": ("2024-01-01", "2024-03-01"),
+            "BTC": ("2025-01-01", "2026-11-09"),
+            "ETH": ("2025-02-01", "2026-11-08"),
+            "SOL": ("2025-01-01", "2026-11-09"),
+        }.items()}
+        first, last, cohort = _matching_window(histories)
+        self.assertEqual(cohort, {"BTC", "ETH", "SOL"})
+        self.assertEqual((first, last), (pd.Timestamp("2025-02-01"), pd.Timestamp("2026-11-08")))
+
 
 class ResearchWorkbookTests(unittest.TestCase):
-    def workbook(self, slow=21):
+    def workbook(self, slow=21, *, fast=8, mode=None):
         """In-memory input fixture; the project workbook remains editable by the user."""
         from io import BytesIO
         from openpyxl import Workbook
@@ -529,12 +657,12 @@ class ResearchWorkbookTests(unittest.TestCase):
                 [1, "Standard MACD", "macd_direction"], [2, "Faster MACD", "macd_direction"],
             ],
             "individual_indicator_settings": [
-                ["indicator_number", "setting", "value"], [2, "fast", 8],
+                ["indicator_number", "setting", "value"], [2, "fast", fast],
                 [2, "slow", slow], [2, "signal", 5],
             ],
             "strategies": [
-                ["strategy_number", "strategy_name", "combination_rule", "weighted_score_threshold", "fee", "Entry filters"],
-                [10, "Blend", "weighted", .5, .002, '=IF(TRUE,"None","")'],
+                ["strategy_number", "strategy_name", "combination_rule", "weighted_score_threshold", "fee", "Entry filters", "signal_mode"],
+                [10, "Blend", "weighted", .5, .002, '=IF(TRUE,"None","")', mode],
                 [20, "Solo", "majority", None, None, "Display only"],
             ],
             "strategy_components": [
@@ -549,6 +677,29 @@ class ResearchWorkbookTests(unittest.TestCase):
         book.save(stream)
         stream.seek(0)
         return stream
+
+    def test_workbook_expands_parameter_lists_and_signal_modes(self):
+        """Both orientations and both parameter axes expand from the workbook."""
+        from research_lab.workbook import load_workbook_configs
+
+        configs = load_workbook_configs(self.workbook(slow="21, 28", fast="8, 12", mode="both"), "polygon")
+        self.assertEqual(len(configs), 12)
+        self.assertEqual(len({cfg["name"] for cfg in configs}), 12)
+        blends = [cfg for cfg in configs if cfg["strategy_number"] == 10]
+        self.assertEqual({(cfg["components"][1]["fast"], cfg["components"][1]["slow"],
+                           cfg.get("invert_signal", False)) for cfg in blends},
+                         {(fast, slow, invert) for fast in (8, 12) for slow in (21, 28)
+                          for invert in (False, True)})
+        self.assertTrue(all(cfg["execution"]["fee"] == .002 for cfg in blends))
+
+    def test_workbook_reports_invalid_sweeps_and_signal_modes(self):
+        """Invalid workbook inputs identify the applicable sheet and row."""
+        from research_lab.workbook import load_workbook_configs
+
+        with self.assertRaisesRegex(ValueError, "strategies, row 2.*signal_mode"):
+            load_workbook_configs(self.workbook(mode="reverse"), "polygon")
+        with self.assertRaisesRegex(ValueError, "individual_indicator_settings, row 3.*MACD fast"):
+            load_workbook_configs(self.workbook(slow="21, 7"), "polygon")
 
     def test_excel_and_direct_configs_have_identical_signals_trades_and_equity(self):
         """Two parameter variants retain separate votes, while shared signals are cached."""
@@ -610,17 +761,23 @@ class ResearchWorkbookTests(unittest.TestCase):
             )
             with patch("config.DB_PATH",db), patch(
                 "research_lab.workbook.load_workbook_configs",return_value=configs
-            ), patch("ui_pages._research_reports"), patch(
+            ), patch("research_lab.report.export_metrics") as export, patch(
                 "research_lab.runner.run_batch",return_value=[(root,{"window_view":"matched-window","jobs":dict(completed=3,skipped=0,failed=0)})]
             ) as run:
                 app = AppTest.from_string("from ui_pages import research_settings\nresearch_settings()").run()
-                self.assertEqual([tab.label for tab in app.tabs], ["Settings", "Run batch", "Reports"])
+                self.assertEqual([tab.label for tab in app.tabs], ["Settings", "Run batch"])
                 self.assertFalse(app.radio)
                 self.assertTrue(any("2 strategies validated" in item.value for item in app.success))
                 next(w for w in app.multiselect if w.label=="Batch strategies").set_value(["Solo"]).run()
                 next(w for w in app.button if w.label=="Run research batch").click().run()
                 self.assertFalse(app.exception)
                 self.assertEqual([c["name"] for c in run.call_args.args[0]], ["Solo"])
+                export.assert_called_once_with(root, save_equity=False)
+                equity = next(w for w in app.checkbox if w.label == "Save equity.csv")
+                self.assertFalse(equity.value)
+                equity.check().run()
+                next(w for w in app.button if w.label == "Run research batch").click().run()
+                export.assert_called_with(root, save_equity=True)
                 # Streamlit receives numeric columns even when some runs were skipped.
                 results = next(table.value for table in app.dataframe if "total_return_pct" in table.value)
                 self.assertEqual(results["symbol"].tolist(), ["00", "NA", "AAVE"])
@@ -738,6 +895,62 @@ class EntryFilterAndSplitTests(unittest.TestCase):
             self.assertTrue(new.loc[new.experiment.str.startswith("strategy:"),"trades"].eq(0).all())
             self.assertTrue(new.loc[new.experiment.str.startswith("strategy:"),"final_equity"].eq(1000.).all())
 
+    def test_intraday_split_preserves_decision_timestamp_and_delays_strategy_fills(self):
+        """The 4h split starts flat and a one-candle delay carries the signal-time filter."""
+        from research_lab.runner import run_split
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root/"prices.db"
+            dates = pd.date_range("2025-01-01", periods=125, freq="4h", tz="UTC")
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute(SCHEMA)
+                rows = []
+                for i, date in enumerate(dates):
+                    price = {112: 110., 113: 111., 114: 112.}.get(i, 100.)
+                    rows.append(("hyperliquid", date.isoformat(), "BTC", "4h", price,
+                                 price+1, price-1, price, 2 if i == 112 else 1))
+                conn.executemany("INSERT INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            cfg = dict(sample_strategy(), trade_direction="long",
+                       execution=dict(stop_atr=None, target_atr=None),
+                       components=[dict(rule="sma_trend", window=2)],
+                       entry_filters=[dict(filter_rule="relative_volume", period=2, threshold=1.5)])
+            boundary = dates[110]
+            with self.assertRaisesRegex(ValueError, "align with a UTC candle open"):
+                run_split([cfg], db, root/"runs", timeframe="4h",
+                          evaluation_start=boundary + pd.Timedelta(hours=1))
+            (dev, _), (evaluation, manifest) = run_split(
+                [cfg], db, root/"runs", timeframe="4h", evaluation_start=boundary,
+                as_of=dates[-1] + pd.Timedelta(hours=4), signal_delay_bars=1,
+            )
+            self.assertEqual(manifest["signal_delay_bars"], 1)
+            self.assertTrue(pd.to_datetime(pd.read_csv(dev/"results.csv").last_candle, utc=True).lt(boundary).all())
+            self.assertTrue(pd.to_datetime(pd.read_csv(evaluation/"results.csv").first_execution, utc=True).eq(boundary).all())
+            trades = pd.read_csv(evaluation/"trades.csv")
+            strategy = trades[trades.experiment.str.startswith("strategy:")]
+            self.assertEqual(len(strategy), 1)
+            self.assertEqual(pd.Timestamp(strategy.iloc[0].signal_candle), dates[112])
+            self.assertEqual(pd.Timestamp(strategy.iloc[0].entry_candle), dates[114])
+            self.assertEqual(pd.Timestamp(strategy.iloc[0].exit_candle), dates[117])
+            self.assertTrue(trades.loc[trades.experiment.str.endswith(":buy_hold"), "entry_candle"].map(pd.Timestamp).eq(boundary).any())
+
+    def test_dated_single_view_does_not_enter_an_already_active_state(self):
+        """An explicit start blocks carried pre-window states in direct single-view runs."""
+        from research_lab.runner import run_batch
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root/"prices.db"
+            dates = pd.date_range("2025-01-01", periods=125)
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute(SCHEMA)
+                conn.executemany("INSERT INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)", [
+                    ("hyperliquid", str(date), "BTC", "1d", 100+i, 101+i, 99+i, 100+i, 1)
+                    for i, date in enumerate(dates)
+                ])
+            cfg = dict(sample_strategy(), components=[dict(rule="sma_trend", window=20)])
+            folder, _ = run_batch([cfg], db, root/"runs", execution_start=dates[110])
+            results = pd.read_csv(folder/"results.csv")
+            self.assertTrue(results.loc[results.experiment.str.startswith("strategy:"), "trades"].eq(0).all())
+
 class ResearchWindowViewTests(unittest.TestCase):
     def test_own_history_is_stable_and_matched_runs_share_actual_dates(self):
         """Longer lookbacks cannot shorten full results; matched trades are rerun on common dates."""
@@ -827,7 +1040,7 @@ class IndicatorCatalogTests(unittest.TestCase):
         candles = pd.DataFrame(dict(high=close+2, low=close-1, close=close, volume=1+t%17), index=index)
         for rule in ("connors_reentry", "supertrend_direction", "vwap_band_reentry", "keltner_breakout",
                      "chandelier_breakout", "mfi_reentry", "cmf_direction", "ichimoku_direction",
-                     "hma_direction", "obv_direction", "stoch_rsi_reentry", "williams_reentry"):
+                     "hma_direction", "obv_direction", "stoch_rsi_reentry", "williams_reentry", "bb_keltner_squeeze", "adx_switch"):
             with self.subTest(rule=rule):
                 config = dict(version=1, name=rule, provider="hyperliquid", components=[dict(rule=rule)])
                 actual = build_signal(candles, config)
@@ -864,3 +1077,153 @@ class IndicatorCatalogTests(unittest.TestCase):
         self.assertEqual(actual.iloc[27], 0)  # 23:00 UTC: flatten at midnight.
         self.assertEqual(actual.iloc[28], 0)  # Midnight begins a new session.
 
+
+
+class DiscoveryRuleTests(unittest.TestCase):
+    def test_squeeze_requires_a_prior_compressed_bar_and_exits_at_ema(self):
+        from research_lab.strategies import bb_keltner_squeeze
+
+        close = pd.Series([10., 10., 10., 12., 12., 9.])
+        candles = pd.DataFrame(dict(close=close, high=close+.1, low=close-.1))
+        settings = dict(period=3, breakout_window=2, squeeze_lookback=1)
+        signal = bb_keltner_squeeze(candles, **settings)
+        self.assertEqual(signal.tolist(), [0, 0, 0, 1, 1, 0])
+        # No breakout if the Keltner channel never strictly encloses the Bollinger band.
+        no_compression = candles.assign(high=close, low=close)
+        self.assertFalse(bb_keltner_squeeze(no_compression, **settings).any())
+        ungated = dict(settings, squeeze_lookback=0)
+        self.assertEqual(bb_keltner_squeeze(no_compression, **ungated).tolist(), signal.tolist())
+        mirror = pd.DataFrame(dict(close=30-close, high=30-candles.low, low=30-candles.high))
+        self.assertEqual(bb_keltner_squeeze(mirror, **settings).tolist(), (-signal).tolist())
+
+    def test_regime_changes_neither_reopen_missed_entries_nor_exit_active_branch(self):
+        from unittest.mock import patch
+        from research_lab.strategies import adx_switch
+
+        close = pd.Series([10.] * 15)
+        candles = pd.DataFrame(dict(close=close, high=close+1, low=close-1))
+        breakout = pd.Series([0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, -1, -1, 0])
+        reversal = pd.Series([0, 0, 0, 0, 0, 0, 0, 0, -1, -1, 0, -1, -1, 0, 0])
+        adx = pd.Series([float("nan")] * 3 + [10, 10, 30, 30, 30, 10, 10, 10, 20, 30, 30, 30])
+        with patch("research_lab.strategies.donchian_breakout", return_value=breakout), \
+             patch("research_lab.strategies.rsi_reentry", return_value=reversal), \
+             patch("research_lab.strategies.dmi_values", return_value=(adx, None, None)):
+            signal = adx_switch(candles, entry_window=2, exit_window=2, adx_period=2)
+        self.assertEqual(signal.tolist(), [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, -1, -1, 0, 0])
+
+
+class DiscoveryExtensionRuleTests(unittest.TestCase):
+    def test_trend_efficiency_uses_absolute_net_move_and_handles_flat_prices(self):
+        from research_lab.strategies import trend_efficiency
+
+        close = pd.Series([10., 11., 10., 10., 10., 11., 12.])
+        actual = trend_efficiency(close, period=2)
+        self.assertTrue(actual.iloc[:2].isna().all())
+        self.assertEqual(actual.iloc[2:].tolist(), [0., 100., 0., 100., 100.])
+
+    def test_realized_volatility_ranks_against_strictly_earlier_values(self):
+        from research_lab.strategies import realized_volatility_percentile
+
+        # Eleven alternating ±log(2) changes have equal variance in every two-bar window.
+        # A +log(16) change makes the last window strictly more volatile than all ten prior ones.
+        close = pd.Series(([1., 2.] * 6) + [32.])
+        actual = realized_volatility_percentile(close, period=2)
+        self.assertTrue(actual.iloc[:12].isna().all())
+        self.assertEqual(actual.iloc[12], 100.)
+        self.assertEqual(realized_volatility_percentile(pd.Series([10.] * 13), period=2).iloc[-1], 50.)
+
+    def test_atr_pullback_requires_recovery_and_exits_at_mean_or_slow_ema(self):
+        from unittest.mock import patch
+        from research_lab.strategies import atr_pullback
+
+        # Constant test averages isolate the exact decision thresholds. ATR is 2,
+        # so 8 is the overshoot boundary and 9 is a valid recovery below the fast EMA.
+        close = pd.Series([10., 8., 9., 9., 10., 8., 9., 6., 8., 10., 8., 7.])
+        candles = pd.DataFrame(dict(close=close, high=close+.2, low=close-.2))
+
+        def ema(values, window):
+            value = 10. if window == 2 else 7.
+            if values.iloc[0] > 10.:
+                value = 30. - value
+            return pd.Series(value, index=values.index)
+
+        with patch("research_lab.strategies.ema_value", side_effect=ema), \
+             patch("research_lab.strategies._atr", return_value=pd.Series(2., index=close.index)):
+            actual = atr_pullback(candles, fast_window=2, slow_window=3)
+            mirror = pd.DataFrame(dict(close=30-close, high=30-candles.low, low=30-candles.high))
+            short = atr_pullback(mirror, fast_window=2, slow_window=3)
+        self.assertEqual(actual.tolist(), [0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0])
+        self.assertEqual(short.tolist(), (-actual).tolist())
+
+    def test_new_rule_and_entry_filters_are_causal_and_registered(self):
+        import numpy as np
+        from research_lab.filters import entry_mask, filter_warmup, validate_filters
+        from research_lab.runner import build_signal, component_warmup, validate_config
+
+        t = np.arange(240)
+        close = 100 + t*.05 + 4*np.sin(t/6.)
+        candles = pd.DataFrame(dict(close=close, high=close+.5, low=close-.5))
+        config = validate_config(dict(sample_strategy(), components=[dict(rule="atr_pullback")]))
+        self.assertEqual(component_warmup(config["components"][0]), 100)
+        actual = build_signal(candles, config)
+        pd.testing.assert_series_equal(actual.iloc[:175], build_signal(candles.iloc[:175], config))
+        for rule, required in (("high_trend_efficiency", 21), ("low_trend_efficiency", 21),
+                               ("low_realized_volatility", 121)):
+            with self.subTest(rule=rule):
+                filters = validate_filters([dict(filter_rule=rule)])
+                self.assertEqual(filter_warmup(filters[0]), required)
+                full = entry_mask(candles, filters, "long", {})
+                self.assertFalse(full.iloc[:required-1].any())
+                self.assertTrue(full.any())
+                pd.testing.assert_series_equal(full.iloc[:175], entry_mask(candles.iloc[:175], filters, "short", {}))
+        with self.assertRaisesRegex(ValueError, "smaller"):
+            validate_config(dict(sample_strategy(), components=[dict(rule="atr_pullback", fast_window=100)]))
+
+
+
+class ResearchFundingAccountingTests(unittest.TestCase):
+    def candles(self):
+        idx = pd.date_range("2025-01-01", periods=4, freq="D", tz="UTC")
+        return pd.DataFrame({"open": 10., "high": 10., "low": 10., "close": 10., "volume": 1.}, index=idx)
+
+    def test_open_exit_does_not_pay_that_bars_funding(self):
+        """Positive funding debits a long and credits a short without double-counting cash."""
+        candles = self.candles()
+        funding = pd.DataFrame({"signed_rate": [.01,.01,.03,.01],
+                                "positive_rate": [.01,.01,.03,.01],
+                                "negative_rate": 0.}, index=candles.index)
+        execution = Execution(fee=0, slippage=0, stop_atr=None, target_atr=None)
+        for side in (1,-1):
+            state = pd.Series([side,0,0,0], index=candles.index)
+            result = simulate(candles, state, settings=execution, funding=funding)
+            trade = result["trades"].iloc[0]
+            self.assertAlmostEqual(trade.funding_paid, side)
+            self.assertAlmostEqual(trade.net_pnl, -side)
+            self.assertAlmostEqual(result["equity"].iloc[-1], 1000-side)
+
+    def test_untradable_observed_candle_defers_open_without_becoming_synthetic(self):
+        """An observed zero-volume candle cannot fill an order; use the next real open."""
+        candles = self.candles()
+        candles.loc[candles.index[1], "volume"] = 0.
+        state = pd.Series([1,1,0,0], index=candles.index)
+        settings = Execution(fee=0, slippage=0, stop_atr=None, target_atr=None)
+        result = simulate(candles, state, settings=settings, tradable=candles.volume.gt(0))
+        trade = result["trades"].iloc[0]
+        self.assertEqual(trade.entry_candle, candles.index[2])
+        self.assertNotIn("synthetic", candles)
+
+    def test_intrabar_stop_uses_adverse_funding_only(self):
+        """An unknown intrabar exit time receives no favorable rate credit."""
+        candles = self.candles()
+        candles.loc[candles.index[1], "low"] = 8.
+        state = pd.Series([1,0,0,0], index=candles.index)
+        atr = pd.Series(1.,index=candles.index)
+        funding = pd.DataFrame({"signed_rate": .005, "positive_rate": .02, "negative_rate": -.015},
+                               index=candles.index)
+        execution = Execution(fee=0, slippage=0, stop_atr=1., target_atr=None)
+        result = simulate(candles, state, atr, settings=execution, funding=funding)
+        trade = result["trades"].iloc[0]
+        self.assertEqual((trade.reason,trade.exit_phase), ("stop","intrabar"))
+        self.assertAlmostEqual(trade.funding_paid, 2.)
+        self.assertAlmostEqual(trade.net_pnl, -12.)
+        self.assertAlmostEqual(result["equity"].iloc[-1], 988.)
