@@ -3,9 +3,11 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import talib
 from numpy.lib.stride_tricks import sliding_window_view
 
 import storage
+from research_lab.strategies import _atr, dmi_values, rsi_value
 from timeframes import completed_bars, get_timeframe
 from config import (DATA_FOLDER, DB_PATH, LOAD_FROM, DEFAULT_TIMEFRAME,
                     MIN_BARS, BUY_THRESHOLD, ACTIVE_PROVIDER, storage_paths)
@@ -13,7 +15,7 @@ from config import (DATA_FOLDER, DB_PATH, LOAD_FROM, DEFAULT_TIMEFRAME,
 # Nine equally weighted directional votes; volatility is a separate entry filter.
 SIGNAL_COLS = ["sma_signal", "ema_signal", "macd_signal", "rsi_signal", "bb_signal",
                "stoch_signal", "adx_signal", "obv_signal", "cci_signal"]
-ENGINE_VERSION = 2
+ENGINE_VERSION = 3
 
 
 # ============================================================
@@ -45,27 +47,6 @@ def get_available_symbols(timeframe=DEFAULT_TIMEFRAME, provider=None):
 # Super Indicator
 # ============================================================
 
-def wilder(s: pd.Series, n: int) -> pd.Series:
-    """Wilder smoothing, the standard for RSI / ATR / ADX."""
-    if not isinstance(n, int) or n < 1:
-        raise ValueError("Smoothing period must be a positive integer")
-    # Seed with the first n contiguous observations, then recurse. A gap resets the seed.
-    result = np.full(len(s), np.nan)
-    seed, previous = [], np.nan
-    for i, value in enumerate(s.to_numpy(dtype=float)):
-        if not np.isfinite(value):
-            seed, previous = [], np.nan
-        elif np.isnan(previous):
-            seed.append(value)
-            if len(seed) == n:
-                previous = float(np.mean(seed))
-                result[i] = previous
-        else:
-            previous += (value - previous) / n
-            result[i] = previous
-    return pd.Series(result, index=s.index)
-
-
 def _mean_abs_dev(x: pd.Series, n: int) -> pd.Series:
     out = np.full(len(x), np.nan)
     if len(x) >= n:
@@ -94,24 +75,17 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["sma_signal"] = ((close > df["sma50"]) & (df["sma50"] > df["sma200"])).astype(float)
 
     # 2. EMA
-    df["ema12"] = close.ewm(span=12, adjust=False).mean()
-    df["ema26"] = close.ewm(span=26, adjust=False).mean()
+    df["ema12"] = talib.EMA(close.astype(float), timeperiod=12)
+    df["ema26"] = talib.EMA(close.astype(float), timeperiod=26)
     df["ema_signal"] = (df["ema12"] > df["ema26"]).astype(float)
 
     # 3. MACD
-    df["macd"] = df["ema12"] - df["ema26"]
-    df["macd_signal_line"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal_line"]
+    df["macd"], df["macd_signal_line"], df["macd_hist"] = talib.MACD(
+        close.astype(float), fastperiod=12, slowperiod=26, signalperiod=9)
     df["macd_signal"] = (df["macd_hist"] > 0).astype(float)   # same as macd > signal line
 
     # 4. RSI (Wilder)
-    delta = close.diff()
-    gain = wilder(delta.clip(lower=0), 14)
-    loss = wilder((-delta).clip(lower=0), 14)
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - 100 / (1 + rs)
-    df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
-    df.loc[(loss == 0) & (gain == 0), "rsi"] = 50
+    df["rsi"] = rsi_value(close, 14)
     df["rsi_signal"] = (df["rsi"] > 50).astype(float)
 
     # 5. Bollinger Bands
@@ -120,30 +94,25 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_signal"] = ((close > df["bb_mid"]) & (close < df["bb_mid"] + 2 * df["bb_std"])).astype(float)
 
     # 6. Stochastic (flat range -> NaN, not a fake value)
-    low14, high14 = low.rolling(14).min(), high.rolling(14).max()
+    low14, high14 = talib.MIN(low.astype(float), 14), talib.MAX(high.astype(float), 14)
     df["stoch_k"] = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
     df["stoch_signal"] = ((df["stoch_k"] > df["stoch_d"]) & (df["stoch_k"] > 20) & (df["stoch_k"] < 80)).astype(float)
 
-    # 7. ADX (Wilder throughout)
-    up, down = high.diff(), -low.diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr = wilder(tr, 14)
-    plus_di = 100 * wilder(plus_dm, 14) / atr
-    minus_di = 100 * wilder(minus_dm, 14) / atr
+    # 7. ADX and directional lines
+    df["adx"], plus_di, minus_di = dmi_values(df, 14)
     df["plus_di"], df["minus_di"] = plus_di, minus_di
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    df["adx"] = wilder(dx, 14)
     df["adx_signal"] = ((df["adx"] > 20) & (plus_di > minus_di)).astype(float)
 
     # 8. ATR -> regime filter, not a directional vote
-    df["atr"] = atr
+    df["atr"] = _atr(df, 14)
     df["regime_ok"] = df["atr"] > df["atr"].rolling(20).mean() * 0.8
 
     # 9. OBV
-    df["obv"] = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    obv_volume = volume.astype(float).copy()
+    if not obv_volume.empty:
+        obv_volume.iloc[0] = 0.
+    df["obv"] = talib.OBV(close.astype(float), obv_volume)
     df["obv_sma"] = df["obv"].rolling(20).mean()
     df["obv_signal"] = (df["obv"] > df["obv_sma"]).astype(float)
 

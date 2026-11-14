@@ -2,6 +2,7 @@
 import math
 
 import pandas as pd
+import talib
 
 
 def _window(window):
@@ -48,11 +49,13 @@ def bollinger_reentry(close, window=20, deviations=2.0):
     return pd.Series(states, index=close.index, dtype="int8", name="bollinger_reentry")
 
 def macd_direction(close, fast=12, slow=26, signal=9):
-    fast_ema = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
-    slow_ema = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
-    macd = fast_ema - slow_ema
-    signal_line = macd.ewm(span=signal, adjust=False, min_periods=signal).mean()
-    histogram = macd - signal_line
+    close = close.astype(float)
+    if fast == 1 or signal == 1:
+        # Period-one EMA is the input itself. MACD's native fast EMA requires 2+.
+        line = ema_value(close, fast) - ema_value(close, slow)
+        histogram = line - ema_value(line, signal)
+    else:
+        _, _, histogram = talib.MACD(close, fastperiod=fast, slowperiod=slow, signalperiod=signal)
     return (
         histogram.gt(0).astype("int8")
         - histogram.lt(0).astype("int8")
@@ -67,10 +70,10 @@ def donchian_breakout(candles, entry_window=55, exit_window=20):
     close = candles["close"]
     # Shift the channels so the signal candle never sets its own threshold.
     high, low = candles["high"].shift(), candles["low"].shift()
-    upper = close.gt(high.rolling(entry_window).max())
-    lower = close.lt(low.rolling(entry_window).min())
-    exit_long = close.lt(low.rolling(exit_window).min())
-    exit_short = close.gt(high.rolling(exit_window).max())
+    upper = close.gt(talib.MAX(high.astype(float), entry_window))
+    lower = close.lt(talib.MIN(low.astype(float), entry_window))
+    exit_long = close.lt(talib.MIN(low.astype(float), exit_window))
+    exit_short = close.gt(talib.MAX(high.astype(float), exit_window))
     warmup = max(entry_window, exit_window)
     state, states = 0, [0] * min(warmup, len(close))
     for buy, sell, long_exit, short_exit in zip(
@@ -87,19 +90,6 @@ def donchian_breakout(candles, entry_window=55, exit_window=20):
         states.append(state)
     return pd.Series(states, index=close.index, dtype="int8", name="donchian_breakout")
 
-def _wilder(values, period):
-    """Seed at the first full arithmetic mean, then apply Wilder's recursion."""
-    seed = values.rolling(period).mean()
-    start = seed.first_valid_index()
-    if start is None:
-        return seed
-    seeded = values.copy()
-    pos = values.index.get_loc(start)
-    seeded.iloc[:pos] = float("nan")
-    seeded.iloc[pos] = seed.iloc[pos]
-    return seeded.ewm(alpha=1/period, adjust=False).mean()
-
-
 def roc_direction(close, window=60):
     """Vote by the sign of the return over the preceding window candles."""
     _window(window)
@@ -110,11 +100,17 @@ def roc_direction(close, window=60):
 def rsi_value(close, period):
     """Wilder RSI, with a neutral value for a flat seeded series."""
     _window(period)
-    delta = close.diff()
-    gains = _wilder(delta.clip(lower=0), period)
-    losses = _wilder(-delta.clip(upper=0), period)
-    total = gains + losses
-    return (100*gains/total.where(total.ne(0))).mask(total.eq(0),50.)
+    close = close.astype(float)
+    # Power-of-two rescaling keeps small token prices above TA-Lib's zero tolerance.
+    first = close.first_valid_index()
+    anchor = abs(close.loc[first]) if first is not None else 0.
+    if 0 < anchor < 1.:
+        _, exponent = math.frexp(anchor)
+        close = close * math.ldexp(1., min(20 - exponent, 1023))
+    value = talib.RSI(close, timeperiod=period)
+    # TA-Lib returns zero before any price movement, including on flat streaks.
+    moved = close.diff().abs().fillna(0).ne(0).cummax()
+    return value.mask(value.notna() & ~moved, 50.)
 
 
 def rsi_reentry(close, period=2, lower=10., upper=90.):
@@ -138,21 +134,12 @@ def rsi_reentry(close, period=2, lower=10., upper=90.):
 
 
 def dmi_values(candles, period):
-    """Return Wilder ADX and the two directional lines."""
+    """Return TA-Lib ADX and the two directional lines."""
     _window(period)
-    high, low, close = candles["high"], candles["low"], candles["close"]
-    up, down = high.diff(), -low.diff()
-    plus = up.where(up.gt(down) & up.gt(0),0.).where(up.notna())
-    minus = down.where(down.gt(up) & down.gt(0),0.).where(down.notna())
-    previous = close.shift()
-    ranges = pd.concat([high-low,(high-previous).abs(),(low-previous).abs()],axis=1).max(axis=1)
-    # DM starts at the first price change; align the true range seed to it.
-    atr = _wilder(ranges.where(previous.notna()), period)
-    plus_di = (100*_wilder(plus,period)/atr.where(atr.ne(0))).mask(atr.eq(0),0.)
-    minus_di = (100*_wilder(minus,period)/atr.where(atr.ne(0))).mask(atr.eq(0),0.)
-    total = plus_di + minus_di
-    dx = (100*(plus_di-minus_di).abs()/total.where(total.ne(0))).mask(total.eq(0),0.)
-    return _wilder(dx,period), plus_di, minus_di
+    high, low, close = (candles[name].astype(float) for name in ("high", "low", "close"))
+    return (talib.ADX(high, low, close, timeperiod=period),
+            talib.PLUS_DI(high, low, close, timeperiod=period),
+            talib.MINUS_DI(high, low, close, timeperiod=period))
 
 
 def adx_dmi(candles, period=14, adx_threshold=20.):
@@ -164,8 +151,8 @@ def adx_dmi(candles, period=14, adx_threshold=20.):
 
 def ema_value(close, window):
     """EMA with no signal value before the full window is observed."""
-    _window(window)
-    return close.ewm(span=window, adjust=False, min_periods=window).mean()
+    close = close.astype(float)
+    return close if window == 1 else talib.EMA(close, timeperiod=window)
 
 
 def ema_trend(close, window=200):
@@ -207,7 +194,8 @@ def _direction(value):
 
 
 def _atr(candles, period):
-    return _wilder(_true_range(candles), period)
+    high, low, close = (candles[name].astype(float) for name in ("high", "low", "close"))
+    return talib.ATR(high, low, close, timeperiod=period)
 
 
 def _true_range(candles):
@@ -225,7 +213,7 @@ def bollinger_width_percentile(candles, period):
 
 
 def choppiness_index(candles, period):
-    span = candles.high.rolling(period).max() - candles.low.rolling(period).min()
+    span = talib.MAX(candles.high.astype(float), period) - talib.MIN(candles.low.astype(float), period)
     ratio = _true_range(candles).rolling(period).sum() / span.where(span.gt(0))
     return 100 * ratio.clip(lower=1).map(math.log10) / math.log10(period)
 
@@ -260,8 +248,8 @@ def connors_reentry(close, rsi_period=3, streak_period=2, rank_period=100, lower
     groups = direction.ne(direction.shift()).cumsum()
     streak = (direction.groupby(groups).cumcount() + 1) * direction
     returns = close.pct_change(fill_method=None)
-    rank = returns.rolling(rank_period + 1).apply(
-        lambda window: 100 * (window[:-1] < window[-1]).mean(), raw=True)
+    lower_count = returns.rolling(rank_period + 1).rank(method="min") - 1
+    rank = 100 * (lower_count / rank_period)
     score = (rsi_value(close, rsi_period) + rsi_value(streak, streak_period) + rank) / 3
     return _reentry(score, lower, upper)
 
@@ -325,10 +313,10 @@ def chandelier_breakout(candles, entry_window=40, period=22, multiplier=3.):
     """Donchian entries with a ratcheting Chandelier exit confirmed on close."""
     close = candles.close
     distance = multiplier * _atr(candles, period)
-    long_level = candles.high.rolling(period).max() - distance
-    short_level = candles.low.rolling(period).min() + distance
-    buy = close.gt(candles.high.shift().rolling(entry_window).max())
-    sell = close.lt(candles.low.shift().rolling(entry_window).min())
+    long_level = talib.MAX(candles.high.astype(float), period) - distance
+    short_level = talib.MIN(candles.low.astype(float), period) + distance
+    buy = close.gt(talib.MAX(candles.high.shift().astype(float), entry_window))
+    sell = close.lt(talib.MIN(candles.low.shift().astype(float), entry_window))
     state, stop, states = 0, math.nan, []
     for price, enter_long, enter_short, lower, upper in zip(close, buy, sell, long_level, short_level):
         if state == 1:
@@ -366,7 +354,7 @@ def cmf_direction(candles, period=20):
 def ichimoku_direction(candles, conversion=9, base=26, span_b=52, displacement=26):
     """Compare today's close with today's cloud, calculated displacement bars ago."""
     def midpoint(period):
-        return (candles.high.rolling(period).max() + candles.low.rolling(period).min()) / 2
+        return (talib.MAX(candles.high.astype(float), period) + talib.MIN(candles.low.astype(float), period)) / 2
 
     span_a = ((midpoint(conversion) + midpoint(base)) / 2).shift(displacement)
     span_b_line = midpoint(span_b).shift(displacement)
@@ -377,18 +365,22 @@ def ichimoku_direction(candles, conversion=9, base=26, span_b=52, displacement=2
 
 def hma_direction(close, window=55):
     """Use Hull MA slope for direction."""
-    def weighted(values, period):
-        weights = pd.Series(range(1, period + 1)).to_numpy(dtype=float)
-        weights /= weights.sum()
-        return values.rolling(period).apply(lambda x: x @ weights, raw=True)
-
-    hull = weighted(2 * weighted(close, window // 2) - weighted(close, window), math.isqrt(window))
-    return _direction(hull.diff())
+    close = close.astype(float)
+    half, smoothing = window // 2, math.isqrt(window)
+    fast = talib.WMA(close, half) if half > 1 else close
+    raw = 2 * fast - talib.WMA(close, window)
+    hull = talib.WMA(raw, smoothing) if smoothing > 1 else raw
+    slope = hull.diff()
+    span = close.rolling(window + smoothing)
+    return _direction(slope.mask(span.max().eq(span.min()), 0.))
 
 
 def obv_direction(candles, period=20):
     """Compare OBV to its own trailing mean; the starting level cancels out."""
-    obv = (_direction(candles.close.diff()) * candles.volume).cumsum()
+    volume = candles.volume.astype(float).copy()
+    if not volume.empty:
+        volume.iloc[0] = 0.
+    obv = talib.OBV(candles.close.astype(float), volume)
     return _direction(obv - obv.rolling(period).mean())
 
 
@@ -401,8 +393,8 @@ def stoch_rsi_reentry(close, period=14, stoch_period=14, smooth=3, lower=20., up
 
 
 def williams_reentry(candles, period=14, lower=-80., upper=-20.):
-    high = candles.high.rolling(period).max()
-    low = candles.low.rolling(period).min()
+    high = talib.MAX(candles.high.astype(float), period)
+    low = talib.MIN(candles.low.astype(float), period)
     span = high - low
     score = -100 * (high - candles.close) / span.where(span.gt(0))
     return _reentry(score, lower, upper, middle=-50)
@@ -424,8 +416,8 @@ def bb_keltner_squeeze(candles, period=20, bb_deviations=2., kc_multiplier=1.5,
     else:
         recent = ema.shift().notna()
 
-    above = close.gt(candles.high.shift().rolling(breakout_window).max())
-    below = close.lt(candles.low.shift().rolling(breakout_window).min())
+    above = close.gt(talib.MAX(candles.high.shift().astype(float), breakout_window))
+    below = close.lt(talib.MIN(candles.low.shift().astype(float), breakout_window))
     long_entry = recent & above & ~above.shift(fill_value=False)
     short_entry = recent & below & ~below.shift(fill_value=False)
     return _hold_states(long_entry, short_entry, close.le(ema), close.ge(ema)).rename("bb_keltner_squeeze")
@@ -472,11 +464,13 @@ def realized_volatility_percentile(close, period=20):
     _window(period)
     volatility = (close / close.shift()).map(math.log).rolling(period).std(ddof=1)
 
-    def midrank(values):
-        historical, current = values[:-1], values[-1]
-        return 100 * ((historical < current).mean() + .5 * (historical == current).mean())
-
-    return volatility.rolling(5 * period + 1).apply(midrank, raw=True)
+    previous_count = 5 * period
+    window = volatility.rolling(previous_count + 1)
+    minimum = window.rank(method="min")
+    maximum = window.rank(method="max")
+    lower_count = minimum - 1
+    equal_count = maximum - minimum
+    return 100 * (lower_count / previous_count + .5 * (equal_count / previous_count))
 
 
 def atr_pullback(candles, fast_window=20, slow_window=100, atr_period=14, pullback_atr=1.):
@@ -498,3 +492,60 @@ def atr_pullback(candles, fast_window=20, slow_window=100, atr_period=14, pullba
     return _hold_states(buy, sell, close.ge(fast) | close.le(slow),
                         close.le(fast) | close.ge(slow)).rename("atr_pullback")
 
+
+
+def aroon_oscillator(candles, period=25, threshold=50.):
+    """Vote beyond the symmetric Aroon Oscillator thresholds."""
+    value = talib.AROONOSC(candles.high, candles.low, timeperiod=period)
+    return (value.gt(threshold).astype("int8") - value.lt(-threshold).astype("int8")).rename("aroon_oscillator")
+
+
+def kama_trend(close, period=30):
+    """Vote by close relative to Kaufman's adaptive moving average."""
+    average = talib.KAMA(close, timeperiod=period)
+    return (close.gt(average).astype("int8") - close.lt(average).astype("int8")).rename("kama_trend")
+
+
+def normalized_atr(candles, period):
+    """TA-Lib normalized ATR in percent of close."""
+    return talib.NATR(candles.high, candles.low, candles.close, timeperiod=period)
+
+
+def parabolic_sar(candles, acceleration=.02, maximum=.2):
+    """Vote by close relative to Parabolic SAR."""
+    level = talib.SAR(candles.high.astype(float), candles.low.astype(float), acceleration=acceleration, maximum=maximum)
+    return _direction(candles.close - level)
+
+
+def ultimate_oscillator(candles, fast=7, medium=14, slow=28, lower=30., upper=70.):
+    """Enter on re-entry from an extreme and exit at the midpoint."""
+    value = talib.ULTOSC(candles.high.astype(float), candles.low.astype(float), candles.close.astype(float),
+                        timeperiod1=fast, timeperiod2=medium, timeperiod3=slow)
+    return _reentry(value, lower, upper)
+
+
+def chaikin_oscillator(candles, fast=3, slow=10):
+    """Vote by the sign of the Chaikin accumulation/distribution oscillator."""
+    value = talib.ADOSC(candles.high.astype(float), candles.low.astype(float), candles.close.astype(float), candles.volume.astype(float),
+                       fastperiod=fast, slowperiod=slow)
+    return _direction(value)
+
+
+def linear_regression_trend(close, period=30):
+    """Vote by the slope of a line fitted to recent closes."""
+    return _direction(talib.LINEARREG_SLOPE(close.astype(float), timeperiod=period))
+
+
+def balance_of_power(candles, period=14):
+    """Vote by the sign of simple-average Balance of Power."""
+    open_, high, low, close = (candles[name].astype(float) for name in ("open", "high", "low", "close"))
+    return _direction(talib.SMA(talib.BOP(open_, high, low, close), timeperiod=period))
+
+
+def engulfing_pattern(candles, hold_bars=1):
+    """Use the most recent engulfing pattern until its holding period expires."""
+    open_, high, low, close = (candles[name].astype(float) for name in ("open", "high", "low", "close"))
+    pattern = _direction(talib.CDLENGULFING(open_, high, low, close))
+    if hold_bars == 1:
+        return pattern
+    return pattern.where(pattern.ne(0)).ffill(limit=hold_bars - 1).fillna(0).astype("int8")

@@ -44,7 +44,8 @@ def current_local_data(symbol, timeframe, now, provider=None):
     return True, False
 
 
-def main(limit=config.FETCH_LIMIT, timeframe=config.DEFAULT_TIMEFRAME, on_progress=None, ignore_exclusions=False, force_refresh=False, provider=None):
+def main(limit=config.FETCH_LIMIT, timeframe=config.DEFAULT_TIMEFRAME, on_progress=None, ignore_exclusions=False,
+         force_refresh=False, provider=None, only_symbols=None):
     def report(**event):
         if on_progress is not None:
             on_progress(event)
@@ -74,7 +75,16 @@ def main(limit=config.FETCH_LIMIT, timeframe=config.DEFAULT_TIMEFRAME, on_progre
             raise RuntimeError("Provider returned no USD pairs")
         fetch_history.save_symbols(config.DB_PATH, provider_name, symbols, now)
     universe = sorted(symbols.items())
-    tickers, skipped, current = [], [], []
+    skipped = []
+    if only_symbols:
+        if isinstance(only_symbols, str):
+            only_symbols = [only_symbols]
+        requested = {s.strip().casefold(): s.strip() for s in only_symbols if s.strip()}
+        available = {s.casefold() for s, _ in universe}
+        universe = [(s, t) for s, t in universe if s.casefold() in requested]
+        skipped = [(symbol, "This provider did not list the requested asset")
+                   for folded, symbol in requested.items() if folded not in available]
+    tickers, current = [], []
     local_synced = 0
     for symbol, ticker in universe:
         try:
@@ -117,7 +127,8 @@ def main(limit=config.FETCH_LIMIT, timeframe=config.DEFAULT_TIMEFRAME, on_progre
         try:
             existing = read_existing(symbol, timeframe, provider_name)
             known = completed_bars(existing, timeframe, utc_now()) if not existing.empty else existing
-            start = config.START_DATE
+            start = (config.BINANCE_START_DATE if provider_name == "binance" and timeframe == "1d"
+                     else config.START_DATE)
             if not existing.empty:
                 start = max(pd.Timestamp(start), existing.index.max() - 2 * interval.duration).strftime("%Y-%m-%d")
             print(f"[{i}/{total}] {symbol}: {start} to {end}", flush=True)
@@ -165,7 +176,8 @@ if __name__ == "__main__":
     parser.add_argument("--ignore-exclusions", action="store_true", help="Retry previously excluded coins for this run")
     parser.add_argument("--force-refresh", action="store_true", help="Refresh discovery and refetch current candles; exclusions still apply")
     parser.add_argument("--provider", choices=PROVIDERS, default=config.ACTIVE_PROVIDER)
+    parser.add_argument("--symbol", action="append", help="Only fetch this asset symbol; repeat for multiple assets")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 0:
         parser.error("limit must be nonnegative")
-    raise SystemExit(main(args.limit, args.timeframe, ignore_exclusions=args.ignore_exclusions, force_refresh=args.force_refresh, provider=args.provider))
+    raise SystemExit(main(args.limit, args.timeframe, ignore_exclusions=args.ignore_exclusions, force_refresh=args.force_refresh, provider=args.provider, only_symbols=args.symbol))

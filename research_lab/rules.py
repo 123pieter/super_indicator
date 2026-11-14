@@ -3,10 +3,12 @@ from dataclasses import dataclass
 from typing import Callable
 from math import isqrt
 
+from .strategies import (balance_of_power, chaikin_oscillator, engulfing_pattern,
+                         linear_regression_trend, parabolic_sar, ultimate_oscillator)
 from .strategies import (adx_dmi, bollinger_reentry, donchian_breakout, ema_trend, macd_direction,
                          roc_direction, rsi_adx_long, rsi_midline_long, rsi_reentry, sma_trend)
 
-from .strategies import (chandelier_breakout, cmf_direction, connors_reentry, hma_direction,
+from .strategies import (aroon_oscillator, kama_trend, adx_switch, atr_pullback, bb_keltner_squeeze, chandelier_breakout, cmf_direction, connors_reentry, hma_direction,
                          ichimoku_direction, keltner_breakout, mfi_reentry, obv_direction,
                          stoch_rsi_reentry, supertrend_direction, vwap_band_reentry, williams_reentry)
 
@@ -115,23 +117,105 @@ def _check_williams(p):
         raise ValueError("Williams %R thresholds must satisfy -100 <= lower < -50 < upper <= 0")
 
 
+
+def _check_adx_switch(params):
+    check_adx(params)
+    check_rsi(params)
+
+
+
+def _check_pullback(params):
+    if params["fast_window"] >= params["slow_window"]:
+        raise ValueError("Fast EMA window must be smaller than slow EMA window")
+
+
+def _check_aroon(params):
+    if params["threshold"] >= 100:
+        raise ValueError("Aroon threshold must be below 100")
+
+
+def _check_sar(params):
+    if params["acceleration"] > params["maximum"]:
+        raise ValueError("SAR acceleration must be at most its maximum")
+
+
+def _check_ultimate(params):
+    if not params["fast"] < params["medium"] < params["slow"]:
+        raise ValueError("Ultimate Oscillator periods must be strictly increasing")
+    check_rsi(params)
+
+
+def _check_chaikin(params):
+    if params["fast"] >= params["slow"]:
+        raise ValueError("Chaikin fast period must be smaller than slow period")
+
+
 REGISTRY.update({
+    "linear_regression_trend": Rule("Linear Regression Slope", linear_regression_trend, {
+        "period": _period(30),
+    }, lambda p: p["period"]),
+    "balance_of_power": Rule("Smoothed Balance of Power", balance_of_power, {
+        "period": _period(14),
+    }, lambda p: p["period"], needs_ohlc=True),
+    "engulfing_pattern": Rule("Engulfing Candle", engulfing_pattern, {
+        "hold_bars": _period(1, "Holding candles", minimum=1),
+    }, lambda p: 3, needs_ohlc=True),
+    "parabolic_sar": Rule("Parabolic SAR", parabolic_sar, {
+        "acceleration": Parameter("Acceleration", .02, 0., True),
+        "maximum": Parameter("Maximum acceleration", .2, 0., True),
+    }, lambda p: 2, _check_sar, needs_ohlc=True),
+    "ultimate_oscillator": Rule("Ultimate Oscillator", ultimate_oscillator, {
+        "fast": _period(7), "medium": _period(14), "slow": _period(28),
+        **_oscillator_bounds(30., 70.),
+    }, lambda p: p["slow"] + 2, _check_ultimate, needs_ohlc=True),
+    "chaikin_oscillator": Rule("Chaikin A/D Oscillator", chaikin_oscillator, {
+        "fast": _period(3), "slow": _period(10),
+    }, lambda p: p["slow"], _check_chaikin, needs_ohlc=True, needs_volume=True),
+    "aroon_oscillator": Rule("Aroon Oscillator", aroon_oscillator, {
+        "period": _period(25), "threshold": Parameter("Aroon threshold", 50., 0.),
+    }, lambda p: p["period"] + 1, _check_aroon, needs_ohlc=True),
+    "kama_trend": Rule("KAMA trend", kama_trend, {
+        "period": _period(30),
+    }, lambda p: p["period"] + 1),
     "connors_reentry": Rule("Connors RSI re-entry", connors_reentry, {
         "rsi_period": _period(3), "streak_period": _period(2), "rank_period": _period(100),
         **_oscillator_bounds(10., 90.),
     }, lambda p: max(p["rsi_period"], p["streak_period"], p["rank_period"] + 1) + 2, check_rsi),
     "supertrend_direction": Rule("SuperTrend", supertrend_direction, {
         "period": _period(10), "multiplier": _multiplier(3.),
-    }, lambda p: p["period"], needs_ohlc=True),
+    }, lambda p: p["period"] + 1, needs_ohlc=True),
     "vwap_band_reentry": Rule("UTC-session VWAP band re-entry", vwap_band_reentry, {
         "deviations": _multiplier(2.),
     }, lambda p: 3, needs_ohlc=True, needs_volume=True, intraday_only=True),
     "keltner_breakout": Rule("Keltner breakout", keltner_breakout, {
         "period": _period(20), "multiplier": _multiplier(1.5),
-    }, lambda p: p["period"], needs_ohlc=True),
+    }, lambda p: p["period"] + 1, needs_ohlc=True),
+    "bb_keltner_squeeze": Rule("Bollinger/Keltner squeeze breakout", bb_keltner_squeeze, {
+        "period": _period(20, "Band period"),
+        "bb_deviations": _multiplier(2.),
+        "kc_multiplier": _multiplier(1.5),
+        "breakout_window": _period(20, "Breakout channel candles"),
+        "squeeze_lookback": _period(5, "Prior squeeze lookback candles (0 disables)", minimum=0),
+    }, lambda p: max(p["period"], p["breakout_window"]) + 1, needs_ohlc=True),
+    "adx_switch": Rule("ADX Donchian/RSI regime switch", adx_switch, {
+        "entry_window": _period(40, "Entry channel candles"),
+        "exit_window": _period(20, "Exit channel candles"),
+        "adx_period": _period(14, "ADX period"),
+        "adx_threshold": Parameter("ADX strength threshold", 20., 0.),
+        "rsi_period": _period(2, "RSI period"),
+        **_oscillator_bounds(10., 90.),
+    }, lambda p: max(p["entry_window"] + 1, p["exit_window"] + 1, 2*p["adx_period"],
+                     p["rsi_period"] + 2), _check_adx_switch, needs_ohlc=True),
+    "atr_pullback": Rule("ATR-normalized EMA pullback", atr_pullback, {
+        "fast_window": _period(20, "Fast EMA candles"),
+        "slow_window": _period(100, "Slow EMA candles"),
+        "atr_period": _period(14, "ATR period"),
+        "pullback_atr": Parameter("Pullback distance in ATR units", 1., 0., True),
+    }, lambda p: max(p["slow_window"], p["fast_window"] + 1, p["atr_period"] + 2),
+       _check_pullback, needs_ohlc=True),
     "chandelier_breakout": Rule("Donchian with Chandelier Exit", chandelier_breakout, {
         "entry_window": _period(40), "period": _period(22), "multiplier": _multiplier(3.),
-    }, lambda p: max(p["entry_window"] + 1, p["period"]), needs_ohlc=True),
+    }, lambda p: max(p["entry_window"] + 1, p["period"] + 1), needs_ohlc=True),
     "mfi_reentry": Rule("Money Flow Index re-entry", mfi_reentry, {
         "period": _period(14), **_oscillator_bounds(20., 80.),
     }, lambda p: p["period"] + 2, check_rsi, needs_ohlc=True, needs_volume=True),

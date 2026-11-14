@@ -74,16 +74,15 @@ class ResearchDataTests(unittest.TestCase):
         self.insert("2025-01-03", timeframe="1d")
         config = dict(version=1, name="Test", provider="polygon",
                       components=[dict(rule="sma_trend")])
-        saved = run_batch([config], self.db, self.db.parent / "runs", timeframe="1d",
-                          as_of="2025-01-10T00:00Z", both_views=True)
-        for folder, manifest in saved:
-            self.assertEqual(manifest["jobs"], dict(completed=0, skipped=4, failed=0))
-            with (folder / "results.csv").open(newline="", encoding="utf-8") as stream:
-                self.assertEqual({row["message"] for row in DictReader(stream)},
-                                 {"Data audit: 1 missing candles within stored history"})
+        folder, manifest = run_batch([config], self.db, self.db.parent / "runs", timeframe="1d",
+                          as_of="2025-01-10T00:00Z")
+        self.assertEqual(manifest["jobs"], dict(completed=0, skipped=2, failed=0))
+        with (folder / "results.csv").open(newline="", encoding="utf-8") as stream:
+            self.assertEqual({row["message"] for row in DictReader(stream)},
+                             {"Data audit: 1 missing candles within stored history"})
 
-    def test_latest_continuous_history_restarts_warmup_in_both_views(self):
-        """A gap removes old candles from warmup and moves the matched window for clean assets."""
+    def test_latest_continuous_history_restarts_warmup(self):
+        """A gap restarts warmup only for the affected asset."""
         from csv import DictReader
         from research_lab.runner import run_batch
 
@@ -94,19 +93,17 @@ class ResearchDataTests(unittest.TestCase):
                 self.insert(str(date.date()), timeframe="1d")
         config = dict(version=1, name="Test", provider="polygon",
                       components=[dict(rule="sma_trend", window=2)])
-        full, matched = run_batch([config], self.db, self.db.parent / "runs", timeframe="1d",
-                                  as_of="2025-06-01", both_views=True, latest_continuous=True)
-        for (folder, manifest), execution_index in ((full, 22), (matched, 108)):
-            btc = next(row for row in manifest["coverage"] if row["symbol"] == "BTC")
-            self.assertEqual(btc["internal_missing"], 2)
-            self.assertEqual(btc["discarded_before_gap"], 6)
-            self.assertEqual(btc["backtest_first_utc"], dates[8].tz_localize("UTC"))
-            with (folder / "results.csv").open(newline="", encoding="utf-8") as stream:
-                strategies = [r for r in DictReader(stream) if r["experiment"].startswith("strategy:")]
-            btc_starts = {r["first_execution"] for r in strategies if r["symbol"] == "BTC"}
-            self.assertEqual(btc_starts, {str(dates[execution_index].tz_localize("UTC"))})
-            if folder == matched[0]:
-                self.assertEqual({r["first_execution"] for r in strategies}, btc_starts)
+        folder, manifest = run_batch([config], self.db, self.db.parent / "runs", timeframe="1d",
+                                     as_of="2025-06-01", latest_continuous=True)
+        btc = next(row for row in manifest["coverage"] if row["symbol"] == "BTC")
+        self.assertEqual(btc["internal_missing"], 2)
+        self.assertEqual(btc["discarded_before_gap"], 6)
+        self.assertEqual(btc["backtest_first_utc"], dates[8].tz_localize("UTC"))
+        with (folder / "results.csv").open(newline="", encoding="utf-8") as stream:
+            strategies = [r for r in DictReader(stream) if r["experiment"].startswith("strategy:")]
+        for symbol, execution_index in (("BTC", 23), ("ETH", 15)):
+            starts = {r["first_execution"] for r in strategies if r["symbol"] == symbol}
+            self.assertEqual(starts, {str(dates[execution_index].tz_localize("UTC"))})
 
     def test_latest_continuous_keeps_other_audit_checks(self):
         """Invalid OHLCV still blocks a series even when a later continuous segment exists."""
@@ -193,6 +190,19 @@ class ResearchEngineTests(unittest.TestCase):
         self.assertEqual((t.signal_candle,t.entry_candle,t.reason,t.quantity,t.net_pnl),
                          (f.index[0],f.index[1],"stop",5.,-10.))
         self.assertEqual(result["equity"].tolist(),[1000.,990.,990.])
+
+    def test_invalid_protective_price_skips_entry_and_replay_continues(self):
+        """Reject invalid brackets, consume the signal, and allow a later fresh entry."""
+        rows = [(10, 11, 9, 10)] * 6
+        for side, levels in ((1, dict(stop_atr=2, target_atr=None)),
+                             (-1, dict(stop_atr=None, target_atr=2))):
+            with self.subTest(side=side):
+                f, signal, atr = self.fixture(rows, [side, side, 0, side, 0, side], [6, 1, 1, 1, 1, 6])
+                settings = Execution(fee=0, slippage=0, **levels)
+                result = simulate(f, signal, atr, settings=settings, preview_next_open=True)
+                self.assertEqual(result["trades"]["entry_candle"].tolist(), [f.index[4]])
+                self.assertEqual(result["equity"].tolist(), [1000.] * len(f))
+                self.assertEqual(result["next_open_orders"], [])
 
     def test_short_signal_exit_and_costs_use_next_opens(self):
         """A short uses adverse fills, pays both fees, and exits after the flat signal."""
@@ -426,7 +436,7 @@ class ResearchBatchTests(unittest.TestCase):
                                  [dates[index].tz_localize("UTC")] * 2)
 
     def test_batch_covers_grid_and_preserves_failures(self):
-        """Run both configs and benchmarks on each pair; report gaps without hiding jobs."""
+        """Run both configs on each pair; report gaps without hiding jobs."""
         from research_lab.runner import run_batch
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -445,22 +455,20 @@ class ResearchBatchTests(unittest.TestCase):
             other = dict(cfg, name="MACD-only", components=[dict(rule="macd_direction", fast=12, slow=101, signal=2)])
             folder, manifest = run_batch([cfg,other],db,root/"runs",as_of="2026-01-01")
             self.assertEqual(manifest["strategy_configs"],2)
-            self.assertEqual(manifest["warmup_candles"], 102)
             self.assertEqual(manifest["unique_strategy_settings"],2)
-            self.assertEqual(manifest["benchmark_configs"],2)
             self.assertEqual(manifest["directional_strategy_configs"],4)
             self.assertEqual(manifest["planned_strategy_jobs"],12)
-            self.assertEqual(manifest["jobs"],dict(completed=12,skipped=6,failed=0))
+            self.assertEqual(manifest["jobs"],dict(completed=8,skipped=4,failed=0))
             result = pd.read_csv(folder/"results.csv")
-            self.assertEqual(len(result),18)
+            self.assertEqual(len(result),12)
             first_strategy = result[result.experiment.str.startswith("strategy:1:")]
             self.assertTrue(first_strategy.strategy_number.eq(37).all())
             self.assertTrue(first_strategy.strategy_name.eq("Example").all())
-            self.assertTrue(result.loc[result.experiment.str.startswith("benchmark:"),"strategy_number"].isna().all())
+            self.assertTrue(result.experiment.str.startswith("strategy:").all())
             self.assertTrue(result.query("symbol == 'GAP'").status.eq("skipped").all())
             for asset in ("AAA","BBB"):
                 rows = result[result.symbol.eq(asset)]
-                self.assertEqual(rows.first_execution.nunique(),1)
+                self.assertGreater(rows.first_execution.nunique(),1)
                 self.assertEqual(rows.last_candle.nunique(),1)
             self.assertEqual(set(pd.read_csv(folder/"equity.csv").symbol),{"AAA","BBB"})
             trades = pd.read_csv(folder/"trades.csv")
@@ -474,28 +482,45 @@ class ResearchBatchTests(unittest.TestCase):
             starts = curves.groupby(["symbol","timeframe","experiment"]).equity.first()
             self.assertTrue(starts.eq(1000.).all())
             self.assertEqual(len(manifest["coverage"][0]["data_sha256"]),64)
-            # The report keeps failed pairs visible but uses a matched universe per timeframe.
+            # The report counts skipped assets alongside the completed full-history runs.
             from research_lab.report import export_metrics
             export_metrics(folder)
             per_asset = pd.read_csv(folder/"metrics_per_asset.csv")
-            self.assertEqual(len(per_asset),18)
+            self.assertEqual(len(per_asset),12)
             overall = pd.read_csv(folder/"metrics_overall.csv")
             hourly = overall[overall.timeframe.eq("1h")]
-            self.assertEqual(len(hourly),6)
-            self.assertTrue(hourly.loc[hourly.experiment.str.startswith("strategy:1:"),"strategy_name"].eq("Example").all())
-            self.assertTrue(hourly.matched_coins.eq(1).all())
-            self.assertTrue(hourly.requested_coins.eq(2).all())
+            self.assertEqual(len(hourly),4)
+            self.assertNotIn("experiment", per_asset.columns)
+            self.assertNotIn("experiment", overall.columns)
+            self.assertEqual(set(hourly.loc[hourly.strategy_name.eq("Example"), "direction"]), {"long", "short"})
+            self.assertTrue(hourly.completed_assets.eq(1).all())
+            self.assertTrue(hourly.requested_assets.eq(2).all())
             # Intraday VWAP remains visible as a daily skip and participates in hourly comparisons.
             vwap = dict(sample_strategy(), name="VWAP", components=[dict(rule="vwap_band_reentry")])
-            _, (matched_folder, _) = run_batch([cfg, other, vwap], db, root/"runs",
-                                              as_of="2026-01-01", both_views=True)
-            export_metrics(matched_folder, save_equity=False)
-            self.assertFalse((matched_folder/"equity.csv").exists())
-            combined = pd.read_csv(matched_folder/"metrics_overall.csv")
-            self.assertEqual(combined.groupby("timeframe").size().to_dict(), {"1d": 6, "1h": 8})
-            self.assertEqual(set(combined.loc[combined.experiment.str.startswith("strategy:3:"), "timeframe"]), {"1h"})
-            daily_details = pd.read_csv(matched_folder/"metrics_per_asset.csv")
-            daily_details = daily_details[daily_details.timeframe.eq("1d") & daily_details.experiment.str.startswith("strategy:3:")]
+            options = dict(as_of="2026-01-01")
+            saved, _ = run_batch([cfg, other, vwap], db, root/"runs", **options)
+            # Fail on any attempt to open equity.csv, including a temporary write followed by deletion.
+            from unittest.mock import patch
+            original_open = Path.open
+
+            def without_equity(path, *args, **kwargs):
+                self.assertNotEqual(path.name, "equity.csv")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", without_equity):
+                no_equity = run_batch([cfg, other, vwap], db, root/"runs", save_equity=False, **options)
+            unsaved, _ = no_equity
+            export_metrics(saved)
+            self.assertFalse((unsaved/"equity.csv").exists())
+            self.assertFalse(any(path.is_dir() for path in unsaved.iterdir()))
+            for filename in ("metrics_per_asset.csv", "metrics_overall.csv"):
+                pd.testing.assert_frame_equal(pd.read_csv(saved/filename), pd.read_csv(unsaved/filename),
+                                              check_exact=False, rtol=1e-10, atol=1e-12)
+            combined = pd.read_csv(unsaved/"metrics_overall.csv")
+            self.assertEqual(combined.groupby("timeframe").size().to_dict(), {"1d": 6, "1h": 6})
+            self.assertEqual(set(combined.loc[combined.strategy_name.eq("VWAP") & combined.completed_assets.gt(0), "timeframe"]), {"1h"})
+            daily_details = pd.read_csv(unsaved/"metrics_per_asset.csv")
+            daily_details = daily_details[daily_details.timeframe.eq("1d") & daily_details.strategy_name.eq("VWAP")]
             self.assertEqual(daily_details.status.tolist(), ["skipped", "skipped"])
 
     def test_batch_rejects_mixed_providers_before_creating_outputs(self):
@@ -512,11 +537,11 @@ class ResearchBatchTests(unittest.TestCase):
     def test_atr_seed_and_next_step(self):
         """ATR14 starts at the mean true range and updates with one Wilder step."""
         from research_lab.runner import atr14
-        frame = pd.DataFrame({"high":[101.]*14+[115.],"low":[99.]*15,"close":[100.]*15})
+        frame = pd.DataFrame({"high":[101.]*15+[115.],"low":[99.]*16,"close":[100.]*16})
         values = atr14(frame)
-        self.assertTrue(values.iloc[:13].isna().all())
-        self.assertEqual(values.iloc[13],2.)
-        self.assertAlmostEqual(values.iloc[14],3.)
+        self.assertTrue(values.iloc[:14].isna().all())
+        self.assertEqual(values.iloc[14],2.)
+        self.assertAlmostEqual(values.iloc[15],3.)
 
 class ResearchReportTests(unittest.TestCase):
     def test_metrics_and_exposure_are_hand_checkable(self):
@@ -566,6 +591,34 @@ class LatestSignalTests(unittest.TestCase):
                        components=[dict(rule="sma_trend", window=2)],
                        execution=dict(stop_atr=None, target_atr=None))
             folder, _ = run_batch([cfg], db, root/"runs", as_of="2026-11-10")
+            from research_lab.runner import run_split
+
+            signals, summary = run_batch([cfg], db, root/"runs", as_of="2026-11-10",
+                                         signals_only=True)
+            self.assertEqual({path.name for path in signals.iterdir()}, {"latest_signals.csv"})
+            self.assertEqual((folder/"latest_signals.csv").read_bytes(),
+                             (signals/"latest_signals.csv").read_bytes())
+            self.assertEqual(summary["jobs"], dict(completed=3, skipped=0, failed=0))
+            # Signals-only keeps the error reason available to Streamlit without another CSV.
+            from unittest.mock import patch
+
+            with patch("research_lab.runner.simulate", side_effect=ValueError("Example replay error")):
+                issue_folder, issue_summary = run_batch(
+                    [cfg], db, root/"runs", as_of="2026-11-10", signals_only=True,
+                )
+            self.assertEqual({p.name for p in issue_folder.iterdir()}, {"latest_signals.csv"})
+            self.assertEqual(issue_summary["jobs"]["failed"], 3)
+            issue, = issue_summary["replay_issues"]
+            self.assertEqual((issue["Status"], issue["Reason"], issue["Replays"]),
+                             ("failed", "Example replay error", 3))
+
+            split = dict(evaluation_start="2026-10-15", as_of="2026-11-10")
+            _, (evaluation, _) = run_split([cfg], db, root/"runs", **split)
+            (signals, _), = run_split([cfg], db, root/"runs", signals_only=True, **split)
+            self.assertEqual({path.name for path in signals.parent.iterdir()}, {"evaluation"})
+            self.assertEqual({path.name for path in signals.iterdir()}, {"latest_signals.csv"})
+            self.assertEqual((evaluation/"latest_signals.csv").read_bytes(),
+                             (signals/"latest_signals.csv").read_bytes())
             entries = pd.read_csv(folder/"latest_signals.csv")
             self.assertEqual(entries.symbol.tolist(), ["CCC"])
             self.assertEqual(entries.event.tolist(), ["entry"])
@@ -625,22 +678,6 @@ class LatestSignalTests(unittest.TestCase):
                 self.assertEqual(orders[1]["take_profit"], replay.iloc[1].target)
             else:
                 self.assertEqual(len(replay), 1)
-
-
-class MatchedCohortTests(unittest.TestCase):
-    def test_disjoint_delisted_history_does_not_empty_matched_window(self):
-        """Choose the common window of the largest group of eligible assets."""
-        from research_lab.runner import _matching_window
-
-        histories = {asset: tuple(pd.Timestamp(date) for date in window) for asset, window in {
-            "old": ("2024-01-01", "2024-03-01"),
-            "BTC": ("2025-01-01", "2026-11-09"),
-            "ETH": ("2025-02-01", "2026-11-08"),
-            "SOL": ("2025-01-01", "2026-11-09"),
-        }.items()}
-        first, last, cohort = _matching_window(histories)
-        self.assertEqual(cohort, {"BTC", "ETH", "SOL"})
-        self.assertEqual((first, last), (pd.Timestamp("2025-02-01"), pd.Timestamp("2026-11-08")))
 
 
 class ResearchWorkbookTests(unittest.TestCase):
@@ -754,15 +791,10 @@ class ResearchWorkbookTests(unittest.TestCase):
                 conn.execute(SCHEMA)
                 conn.execute("INSERT INTO ohlcv VALUES (?,?,?,?,?,?,?,?,?)",
                              ("polygon","2025-01-01","AAVE","1d",10,12,9,11,1))
-            (root/"results.csv").write_text(
-                "symbol,status,strategy_number,trades,total_return_pct\n"
-                "00,completed,1,10,12.5\nNA,completed,2,2,-3.5\nAAVE,skipped,3,,\n",
-                encoding="utf-8",
-            )
             with patch("config.DB_PATH",db), patch(
                 "research_lab.workbook.load_workbook_configs",return_value=configs
             ), patch("research_lab.report.export_metrics") as export, patch(
-                "research_lab.runner.run_batch",return_value=[(root,{"window_view":"matched-window","jobs":dict(completed=3,skipped=0,failed=0)})]
+                "research_lab.runner.run_batch",return_value=(root,{"window_view":"full-history","jobs":dict(completed=3,skipped=0,failed=0)})
             ) as run:
                 app = AppTest.from_string("from ui_pages import research_settings\nresearch_settings()").run()
                 self.assertEqual([tab.label for tab in app.tabs], ["Settings", "Run batch"])
@@ -772,18 +804,22 @@ class ResearchWorkbookTests(unittest.TestCase):
                 next(w for w in app.button if w.label=="Run research batch").click().run()
                 self.assertFalse(app.exception)
                 self.assertEqual([c["name"] for c in run.call_args.args[0]], ["Solo"])
-                export.assert_called_once_with(root, save_equity=False)
+                self.assertFalse(run.call_args.kwargs["save_equity"])
+                export.assert_not_called()
                 equity = next(w for w in app.checkbox if w.label == "Save equity.csv")
                 self.assertFalse(equity.value)
                 equity.check().run()
                 next(w for w in app.button if w.label == "Run research batch").click().run()
-                export.assert_called_with(root, save_equity=True)
-                # Streamlit receives numeric columns even when some runs were skipped.
-                results = next(table.value for table in app.dataframe if "total_return_pct" in table.value)
-                self.assertEqual(results["symbol"].tolist(), ["00", "NA", "AAVE"])
-                self.assertTrue(pd.api.types.is_integer_dtype(results["trades"]))
-                self.assertTrue(pd.api.types.is_float_dtype(results["total_return_pct"]))
-                self.assertEqual(results.sort_values("trades")["symbol"].tolist(), ["NA", "00", "AAVE"])
+                self.assertTrue(run.call_args.kwargs["save_equity"])
+                export.assert_called_once_with(root)
+                # The batch exposes its output location without opening a results viewer.
+                self.assertTrue(any(block.value == str(root) for block in app.code))
+                self.assertFalse(any(box.label == "Batch result view" for box in app.selectbox))
+                self.assertFalse(app.tabs[1].dataframe)
+                next(w for w in app.button if w.label=="Generate latest signals only").click().run()
+                self.assertFalse(app.exception)
+                self.assertTrue(run.call_args.kwargs["signals_only"])
+                export.assert_called_once_with(root)
 
 class DonchianResearchTests(unittest.TestCase):
     def test_uses_prior_highs_and_lows_and_exits_before_reversing(self):
@@ -886,8 +922,8 @@ class EntryFilterAndSplitTests(unittest.TestCase):
                 [cfg],db,root/"runs",evaluation_start=boundary,as_of=dates[-1]+pd.Timedelta(days=1))
             self.assertEqual(dev_manifest["split_id"],eval_manifest["split_id"])
             self.assertEqual(dev_manifest["experiments"],eval_manifest["experiments"])
-            self.assertEqual(dev_manifest["jobs"]["completed"],4)
-            self.assertEqual(eval_manifest["jobs"]["completed"],4)
+            self.assertEqual(dev_manifest["jobs"]["completed"],2)
+            self.assertEqual(eval_manifest["jobs"]["completed"],2)
             old = pd.read_csv(dev/"results.csv")
             new = pd.read_csv(evaluation/"results.csv")
             self.assertTrue(pd.to_datetime(old.last_candle,utc=True).lt(boundary.tz_localize("UTC")).all())
@@ -931,7 +967,6 @@ class EntryFilterAndSplitTests(unittest.TestCase):
             self.assertEqual(pd.Timestamp(strategy.iloc[0].signal_candle), dates[112])
             self.assertEqual(pd.Timestamp(strategy.iloc[0].entry_candle), dates[114])
             self.assertEqual(pd.Timestamp(strategy.iloc[0].exit_candle), dates[117])
-            self.assertTrue(trades.loc[trades.experiment.str.endswith(":buy_hold"), "entry_candle"].map(pd.Timestamp).eq(boundary).any())
 
     def test_dated_single_view_does_not_enter_an_already_active_state(self):
         """An explicit start blocks carried pre-window states in direct single-view runs."""
@@ -952,8 +987,8 @@ class EntryFilterAndSplitTests(unittest.TestCase):
             self.assertTrue(results.loc[results.experiment.str.startswith("strategy:"), "trades"].eq(0).all())
 
 class ResearchWindowViewTests(unittest.TestCase):
-    def test_own_history_is_stable_and_matched_runs_share_actual_dates(self):
-        """Longer lookbacks cannot shorten full results; matched trades are rerun on common dates."""
+    def test_own_history_is_stable_and_overall_uses_all_completed_assets(self):
+        """Lookbacks preserve each history; recent listings count even without SMA100 coverage."""
         from research_lab.runner import run_batch
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -969,10 +1004,10 @@ class ResearchWindowViewTests(unittest.TestCase):
             fast = dict(sample_strategy(),name="Fast",components=[dict(rule="sma_trend",window=20)])
             slow = dict(fast,name="Slow",entry_filters=[dict(filter_rule="ema_alignment",period=120)])
             def run(configs, **options):
-                return run_batch(configs,db,root/"runs",both_views=True,as_of="2026-01-01",**options)
-            (solo,_),_ = run([fast],symbol="A")
-            (full,fm),(matched,mm) = run([fast,slow])
-            self.assertEqual((fm["window_view"],mm["window_view"]),("full-history","matched-window"))
+                return run_batch(configs,db,root/"runs",as_of="2026-01-01",**options)
+            solo,_ = run([fast],symbol="A")
+            full,fm = run([fast,slow])
+            self.assertEqual(fm["window_view"], "full-history")
             read = lambda folder: pd.read_csv(folder/"results.csv")
             keys = ["first_execution","last_candle","execution_candles","trades","final_equity"]
             expected = read(solo).query("experiment == 'strategy:1:long'")[keys].reset_index(drop=True)
@@ -980,15 +1015,15 @@ class ResearchWindowViewTests(unittest.TestCase):
             pd.testing.assert_frame_equal(expected,actual,check_dtype=False)
             self.assertEqual(actual.execution_candles.iloc[0],140)
             self.assertEqual(read(full).query("symbol == 'NEW' and experiment == 'strategy:1:long'").status.iloc[0],"completed")
-            shared = read(matched)
-            self.assertTrue(shared.query("symbol == 'NEW'").status.eq("skipped").all())
-            done = shared[shared.status.eq("completed")]
-            self.assertEqual(set(done.symbol),{"A","B"})
-            self.assertEqual(set(pd.to_datetime(done.first_execution).dt.tz_localize(None)),{base+pd.Timedelta(days=130)})
-            self.assertEqual(set(pd.to_datetime(done.last_candle).dt.tz_localize(None)),{base+pd.Timedelta(days=154)})
-            self.assertTrue(done.execution_candles.eq(25).all())
-            self.assertTrue(done[done.experiment.str.startswith("strategy:")].trades.eq(0).all())
-            self.assertTrue(done[done.experiment.str.startswith("strategy:")].final_equity.eq(1000.).all())
+            from research_lab.report import export_metrics
+
+            export_metrics(full)
+            rows = pd.read_csv(full/"metrics_per_asset.csv")
+            fast_long = rows.query("strategy_name == 'Fast' and direction == 'long'")
+            overall = pd.read_csv(full/"metrics_overall.csv")
+            summary = overall.query("strategy_name == 'Fast' and direction == 'long'").iloc[0]
+            self.assertEqual(summary.completed_assets, 3)
+            self.assertAlmostEqual(summary.mean_asset_return_pct, fast_long.total_return_pct.mean())
 
 class FollowupStrategyTests(unittest.TestCase):
     def test_relative_volume_uses_previous_bars_and_is_direction_neutral(self):
@@ -1083,11 +1118,11 @@ class DiscoveryRuleTests(unittest.TestCase):
     def test_squeeze_requires_a_prior_compressed_bar_and_exits_at_ema(self):
         from research_lab.strategies import bb_keltner_squeeze
 
-        close = pd.Series([10., 10., 10., 12., 12., 9.])
+        close = pd.Series([10., 10., 10., 10., 12., 12., 9.])
         candles = pd.DataFrame(dict(close=close, high=close+.1, low=close-.1))
         settings = dict(period=3, breakout_window=2, squeeze_lookback=1)
         signal = bb_keltner_squeeze(candles, **settings)
-        self.assertEqual(signal.tolist(), [0, 0, 0, 1, 1, 0])
+        self.assertEqual(signal.tolist(), [0, 0, 0, 0, 1, 1, 0])
         # No breakout if the Keltner channel never strictly encloses the Bollinger band.
         no_compression = candles.assign(high=close, low=close)
         self.assertFalse(bb_keltner_squeeze(no_compression, **settings).any())

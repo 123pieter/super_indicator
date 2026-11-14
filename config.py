@@ -41,11 +41,16 @@ def load_api_key(filepath=None):
 PROVIDER_FETCH_DEFAULTS = {
     "polygon": {"max_missing_bars": None, "exclude_no_data": False},
     "hyperliquid": {"max_missing_bars": None, "exclude_no_data": False},
+    "binance": {"max_missing_bars": None, "exclude_no_data": False},
 }
 
 # Native perpetuals by default; add e.g. "xyz" or "km" for builder-deployed markets.
 HYPERLIQUID_DEXES = ("",)
 HYPERLIQUID_REQUEST_DELAY = 6
+
+# Explicit core archive scope if public Binance USD-M REST is unavailable.
+BINANCE_ARCHIVE_TICKERS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+BINANCE_START_DATE = "2020-01-01"
 
 
 def storage_paths(provider, data_folder=None, database=None):
@@ -60,6 +65,7 @@ def storage_paths(provider, data_folder=None, database=None):
 BACKTEST_COSTS = {
     "polygon": {"fee": 0.001, "slippage": 0.0005},
     "hyperliquid": {"fee": 0.001, "slippage": 0.0005},
+    "binance": {"fee": 0.001, "slippage": 0.0005},
 }
 STOP_ATR = 3.0
 TP_ATR = 6.0  # None disables the take-profit.

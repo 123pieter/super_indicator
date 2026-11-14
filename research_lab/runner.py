@@ -1,4 +1,5 @@
 """Validate portable research strategy configs and build their close-based signal."""
+from collections import Counter
 from contextlib import ExitStack, nullcontext
 import csv
 from dataclasses import asdict
@@ -17,7 +18,7 @@ from .data import audit_problem, backtest_history, fill_empty_candles, load_pair
 from .engine import Execution, TRADE_COLUMNS, simulate
 from .filters import entry_mask, filter_warmup, validate_filters
 from .rules import REGISTRY
-from .strategies import _atr, sma_trend
+from .strategies import _atr
 
 RULES = {name: rule.function for name, rule in REGISTRY.items()}
 METHODS = ("majority", "weighted", "and", "or")
@@ -93,7 +94,8 @@ def duplicate_signal_count(config):
 
 def validate_config(config):
     """Return a fully specified config; reject typos and invalid risk assumptions."""
-    _object(config, ("version", "name", "provider", "components", "combination", "execution", "entry_filters", "strategy_number", "trade_direction"), "Config")
+    _object(config, ("version", "name", "provider", "components", "combination", "execution",
+                     "entry_filters", "strategy_number", "trade_direction", "invert_signal"), "Config")
     if type(config.get("version")) is not int or config["version"] != 1:
         raise ValueError("Config version must be 1")
     name, provider = config.get("name"), config.get("provider")
@@ -139,6 +141,11 @@ def validate_config(config):
         raise ValueError("Trade direction must be both, long or short")
     if direction != "both":
         result["trade_direction"] = direction
+    invert_signal = config.get("invert_signal", False)
+    if type(invert_signal) is not bool:
+        raise ValueError("Invert signal must be true or false")
+    if invert_signal:
+        result["invert_signal"] = True
     filters = validate_filters(config.get("entry_filters", []))
     if filters:
         result["entry_filters"] = filters
@@ -151,9 +158,10 @@ def is_intraday_strategy(cfg):
 
 
 def build_signal(candles, config, *, cache=None):
-    """Combine close states; close-only strategies also accept a Series.
+    """Combine close states and apply the configured signal orientation.
 
-    An optional cache is local to one candle history.
+    Close-only strategies accept a Series. A component cache is local to one
+    candle history and can be shared by standard and inverted strategies.
     """
     frame = candles if isinstance(candles, pd.DataFrame) else None
     close = frame["close"] if frame is not None else candles
@@ -187,48 +195,41 @@ def build_signal(candles, config, *, cache=None):
     else:
         long, short = votes.eq(1).any(axis=1), votes.eq(-1).any(axis=1)
     # OR with opposing votes, ties, and insufficient support all produce flat.
-    return (long.astype("int8") - short.astype("int8")).rename("combined")
+    signal = (long.astype("int8") - short.astype("int8")).rename("combined")
+    return -signal if cfg.get("invert_signal") else signal
+
 
 def atr14(candles):
-    """True range with an arithmetic seed, followed by Wilder smoothing."""
+    """TA-Lib ATR used for sizing and protective orders."""
     return _atr(candles, 14)
 
 
 def strategy_identity(experiment):
-    """Use the saved workbook identity; benchmarks have no workbook number."""
+    """Use the saved workbook identity when available."""
     cfg = experiment.get("config") or {}
     return dict(strategy_number=cfg.get("strategy_number"),
                 strategy_name=cfg.get("name", experiment["name"]))
 
 
 def strategy_directions(cfg):
-    """Older workbooks default to independent long and short simulations."""
-    direction = cfg.get("trade_direction","both")
-    return ("long","short") if direction=="both" else (direction,)
+    """Return executed sides for the configured original signal sides."""
+    direction = cfg.get("trade_direction", "both")
+    if direction == "both":
+        return "long", "short"
+    if cfg.get("invert_signal"):
+        direction = "short" if direction == "long" else "long"
+    return (direction,)
 
 
 def _experiments(configs):
-    """Pair each cost/capital assumption with fully invested comparison rules."""
-    experiments, benchmarks = [], {}
+    """Create one replay for each configured strategy direction."""
+    experiments = []
     for i, cfg in enumerate(configs, 1):
         execution = Execution(**cfg["execution"])
-        cost_key = (execution.initial_capital, execution.fee, execution.slippage)
-        if cost_key not in benchmarks:
-            group = len(benchmarks)+1
-            benchmarks[cost_key] = group
-        else:
-            group = benchmarks[cost_key]
         for direction in strategy_directions(cfg):
             experiments.append(dict(id=f"strategy:{i}:{direction}",
                                     name=f"{cfg['name']} ({direction} only)", kind="strategy",
-                                    direction=direction, group=group,
-                                    execution=execution, config=cfg))
-    for (capital, fee, slip), group in benchmarks.items():
-        settings = Execution(initial_capital=capital, fee=fee, slippage=slip, fraction=1.,
-                             stop_atr=None, target_atr=None)
-        for rule, name in (("buy_hold", "Buy and hold"), ("sma100", "SMA100 long/cash")):
-            experiments.append(dict(id=f"benchmark:{group}:{rule}", name=name, kind=rule,
-                                    direction="long", group=group, execution=settings, config=None))
+                                    direction=direction, execution=execution, config=cfg))
     return experiments
 
 
@@ -237,16 +238,10 @@ def component_warmup(component):
     return REGISTRY[component["rule"]].warmup(component)
 
 
-def shared_warmup(configs):
-    """Return the longest warmup of the selected strategies and benchmarks."""
-    return max(100, 14, *(component_warmup(c) for cfg in configs for c in cfg["components"]),
-               *(filter_warmup(f) for cfg in configs for f in cfg.get("entry_filters", [])))
-
-
 def strategy_warmup(cfg):
     """Minimum candle count for a strategy, including ATR only when used."""
     execution = cfg["execution"]
-    atr = 14 if execution["stop_atr"] is not None or execution["target_atr"] is not None else 0
+    atr = 15 if execution["stop_atr"] is not None or execution["target_atr"] is not None else 0
     return max(atr, *(component_warmup(c) for c in cfg["components"]),
                *(filter_warmup(f) for f in cfg.get("entry_filters", [])))
 
@@ -259,61 +254,79 @@ def _prepare_history(candles, audit, provider, latest_continuous, fill_confirmed
     return backtest_history(candles, audit, latest_continuous)
 
 
-def _matched_dates(conn, provider, pairs, cutoff, warmup, phase, split,
-                   latest_continuous, fill_confirmed_gaps):
-    """Find one common window per timeframe using eligible, audited histories."""
-    dates = {}
-    for asset, interval in pairs:
-        candles, audit = load_pair(conn,provider,asset,interval,cutoff,
-                                  historical_cutoff=phase=="development")
-        candles, trimmed = _prepare_history(candles, audit, provider, latest_continuous, fill_confirmed_gaps)
-        first = _first_candle(candles, warmup, phase, split, exact=True)
-        if (audit["status"] != "ok" and not trimmed and "synthetic" not in candles) or first is None:
-            continue
-        start, end = candles.index[first], candles.index[-1]
-        if interval in dates:
-            old_start, old_end = dates[interval]
-            start, end = max(start,old_start), min(end,old_end)
-        dates[interval] = (start,end)
-    return dates
-
-
-def _first_candle(candles, warmup, phase, split, *, exact):
+def _first_candle(candles, warmup, phase, split, *, execution_start=None):
     if len(candles) <= warmup:
         return None
-    if phase != "evaluation":
-        return warmup
-    boundary = candles.index.searchsorted(split)
-    if exact and (boundary < warmup or boundary == len(candles) or candles.index[boundary] != split):
+    earliest = warmup if execution_start is None else max(warmup, candles.index.searchsorted(execution_start))
+    if len(candles) <= earliest:
         return None
-    first = max(warmup,boundary)
+    if phase != "evaluation":
+        return earliest
+    boundary = candles.index.searchsorted(split)
+    first = max(earliest,boundary)
     return first if first < len(candles) else None
 
 
-def _open_run(root, cutoff, phase, view, stack, columns, result_columns):
-    suffix = "-".join(x for x in (phase, view) if x)
-    folder = root/(cutoff.strftime("%Y%m%dT%H%M%SZ-")+uuid4().hex+(f"-{suffix}" if suffix else ""))
-    folder.mkdir(exist_ok=False)  # Inherit the project ACL on Windows.
+def _new_batch_folder(output_root):
+    """Reserve a batch folder without overwriting an earlier run."""
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = pd.Timestamp.now().strftime("%Y%d%H%M")
+    folder = root / stamp
+    counter = 2
+    while True:
+        try:
+            folder.mkdir()
+            return folder
+        except FileExistsError:
+            folder = root / f"{stamp}-{counter}"
+            counter += 1
+
+
+def _open_run(root, phase, stack, columns, result_columns, save_equity, signals_only):
+    folder = root / phase if phase else root
+    folder.mkdir(parents=True, exist_ok=True)
     writers = []
-    for filename, fields in (("results.csv",result_columns),("trades.csv",columns+TRADE_COLUMNS),
-                             ("equity.csv",columns+["candle","equity","synthetic"])):
+    files = [("results.csv", result_columns), ("trades.csv", columns + TRADE_COLUMNS)]
+    if save_equity:
+        files.append(("equity.csv", columns + ["candle", "equity", "synthetic"]))
+    for filename, fields in (() if signals_only else files):
         handle = stack.enter_context((folder/filename).open("w",newline="",encoding="utf-8"))
-        writer = csv.DictWriter(handle,fieldnames=fields)
-        writer.writeheader()
+        if filename == "equity.csv":
+            writer = csv.writer(handle)
+            writer.writerow(fields)
+        else:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
         writers.append(writer)
-    return folder, writers, dict(completed=0,skipped=0,failed=0)
+    writers.extend([None] * (3 - len(writers)))
+    signal_writer = None
+    if phase != "development":
+        handle = stack.enter_context((folder/"latest_signals.csv").open("w", newline="", encoding="utf-8"))
+        signal_columns = [column for column in columns if column != "experiment"]
+        signal_writer = csv.DictWriter(handle, fieldnames=signal_columns+[
+            "signal_candle_utc", "execution_candle_utc", "event", "action", "position_side",
+            "reference_entry_price", "stop_loss", "take_profit", "quantity", "reason",
+        ])
+        signal_writer.writeheader()
+    return folder, writers, dict(completed=0,skipped=0,failed=0), signal_writer
 
 
 def run_batch(configs, database, output_root, *, symbol=None, timeframe=None, as_of=None,
-              on_progress=None, _connection=None, _split=None, _phase=None, _split_id=None,
-              both_views=False, latest_continuous=False, fill_confirmed_gaps=False):
+              on_progress=None, _connection=None, _split=None, _phase=None, _split_id=None, _batch_folder=None,
+              latest_continuous=False, fill_confirmed_gaps=False, coverage_on=None,
+              execution_start=None, include_funding=False, signal_delay_bars=0, save_equity=True,
+              signals_only=False):
     """Run one provider's grid, streaming outputs instead of retaining all equity in memory.
 
-    The default direct call retains the legacy single view. With both_views,
-    full history uses own warmups and matched windows align all eligible pairs.
+    Each strategy starts after its own warmup on each asset.
     With latest_continuous, a pair with only internal gaps uses its final contiguous segment.
-    Results use all eligible history and are descriptive, not holdout tests.
+    Signal delay shifts strategy states, entry filters and signal-time ATR together.
+    Without equity export, summarize each curve immediately and release it.
+    Signals-only mode replays strategies and writes only next-open entries.
     """
+    if type(signal_delay_bars) is not int or signal_delay_bars < 0:
+        raise ValueError("Signal delay must be a nonnegative whole number of candles")
     if latest_continuous and fill_confirmed_gaps:
         raise ValueError("Choose one candle gap policy")
     configs = [validate_config(cfg) for cfg in configs]
@@ -326,9 +339,19 @@ def run_batch(configs, database, output_root, *, symbol=None, timeframe=None, as
     cutoff = pd.Timestamp.now(tz="UTC") if as_of is None else pd.to_datetime(as_of, utc=True)
     if pd.isna(cutoff):
         raise ValueError("Batch cutoff must be a valid timestamp")
+    if execution_start is not None:
+        execution_start = pd.to_datetime(execution_start, utc=True)
+        if pd.isna(execution_start) or execution_start >= cutoff:
+            raise ValueError("Execution start must be before the batch cutoff")
+    if include_funding and provider not in ("binance", "hyperliquid"):
+        raise ValueError("Estimated historical funding requires Binance or Hyperliquid")
+    # A chosen historical end clips later stored prices. Ordinary current runs
+    # still flag genuinely future-dated rows.
+    historical_cutoff = _phase=="development" or (
+        as_of is not None and cutoff.normalize() < pd.Timestamp.now(tz="UTC").normalize())
+    save_equity = save_equity and not signals_only
     experiments = _experiments(configs)
-    directional_count = sum(len(strategy_directions(cfg)) for cfg in configs)
-    warmup = shared_warmup(configs)
+    directional_count = len(experiments)
     settings_count = len({json.dumps(dict(
         {k:v for k,v in cfg.items() if k not in ("name", "strategy_number", "components")},
         components=[{k:v for k,v in c.items() if k not in ("indicator_number", "indicator_name", "category")}
@@ -337,33 +360,57 @@ def run_batch(configs, database, output_root, *, symbol=None, timeframe=None, as
     columns = ["provider", "symbol", "timeframe", "strategy_number", "strategy_name", "experiment"]
     result_columns = columns + ["direction", "status", "message", "warmup_candles",
                                 "first_execution", "last_candle", "execution_candles",
-                                "synthetic_candles_used", "synthetic_candles_in_test_window",
-                                "trades", "final_equity", "total_return_pct"]
+                                "synthetic_candles_used", "synthetic_candles_in_test_window", "non_tradable_candles",
+                                "trades", "final_equity", "total_return_pct", "funding_paid"]
     source = open_ohlcv(database) if _connection is None else nullcontext(_connection)
-    views = ("full-history", "matched-window") if both_views else (None,)
     with source as conn, ExitStack() as stack:
-        pairs = [(asset, interval) for asset, interval in stored_pairs(conn, provider)
-                 if (symbol is None or asset == symbol) and (timeframe is None or interval == timeframe)]
+        pairs = stored_pairs(conn, provider, coverage_on=coverage_on, symbol=symbol, timeframe=timeframe)
         if not pairs:
             raise ValueError("No stored asset/timeframe pairs match the batch")
-        common = (_matched_dates(conn, provider, pairs, cutoff, warmup, _phase, _split,
-                                 latest_continuous, fill_confirmed_gaps) if both_views else {})
-        root = Path(output_root)
-        root.mkdir(parents=True,exist_ok=True)
-        outputs = {view: _open_run(root,cutoff,_phase,view,stack,columns,result_columns)
-                   for view in views}
+        root = _new_batch_folder(output_root) if _batch_folder is None else _batch_folder
+        folder, writers, counts, signal_writer = _open_run(root, _phase, stack, columns, result_columns, save_equity, signals_only)
+        result_writer, trade_writer, equity_writer = writers
+
+        replay_issues = Counter()
+        replay_examples = {}
+
+        def record_issue(status, message, summary):
+            counts[status] += 1
+            if result_writer is not None:
+                result_writer.writerow(dict(summary, status=status, message=message))
+            elif signals_only:
+                issue = status, message
+                replay_issues[issue] += 1
+                replay_examples.setdefault(issue, f"{summary['symbol']} / {summary['timeframe']} / {summary['experiment']}")
+
+        metric_rows = {}
+        if not save_equity and not signals_only:
+            from .report import bar_exposure, metrics
+        latest_signal_candle = None
+        latest_entries = []
         for i, (asset, interval) in enumerate(pairs, 1):
             candles, audit = load_pair(conn,provider,asset,interval,cutoff,
-                                       historical_cutoff=_phase=="development")
-            audit["data_sha256"] = hashlib.sha256(
-                pd.util.hash_pandas_object(candles,index=True).to_numpy().tobytes()
-            ).hexdigest()
+                                       historical_cutoff=historical_cutoff)
             original_count = len(candles)
+            if original_count and (latest_signal_candle is None or candles.index[-1] > latest_signal_candle):
+                latest_signal_candle = candles.index[-1]
+                latest_entries.clear()
+            if signals_only and (not original_count or candles.index[-1] < latest_signal_candle):
+                if on_progress is not None:
+                    on_progress(i, len(pairs), asset, interval)
+                continue
+            if not signals_only:
+                audit["data_sha256"] = hashlib.sha256(
+                    pd.util.hash_pandas_object(candles, index=True).to_numpy().tobytes()
+                ).hexdigest()
             candles, trimmed = _prepare_history(candles, audit, provider, latest_continuous, fill_confirmed_gaps)
             synthetic = candles.get("synthetic", pd.Series(False, index=candles.index))
             audit["synthetic_candles"] = int(synthetic.sum())
             if audit["synthetic_candles"]:
                 audit["synthetic_dates_utc"] = [date.isoformat() for date in candles.index[synthetic]]
+            if save_equity:
+                equity_dates = [str(date) for date in candles.index]
+                equity_synthetic = synthetic.tolist()
             if trimmed:
                 audit.update(backtest_first_utc=candles.index[0],
                              backtest_usable=len(candles),
@@ -372,150 +419,202 @@ def run_batch(configs, database, output_root, *, symbol=None, timeframe=None, as
             valid = audit["status"] == "ok" or trimmed or bool(audit["synthetic_candles"])
             if valid:
                 atr = atr14(candles)
-                baseline = sma_trend(candles.close)
-                trend = baseline.clip(lower=0)
-                hold = pd.Series(1,index=candles.index,dtype="int8")
-                signal_cache = {("sma_trend", (("window",100),)): baseline}
-                filter_cache, combined_cache = {}, {}
+                strategy_atr = atr.shift(signal_delay_bars) if signal_delay_bars else atr
+                signal_cache, filter_cache, combined_cache, funding_cache = {}, {}, {}, {}
             for exp in experiments:
                 cfg = exp["config"]
-                intraday_mismatch = (cfg is not None and is_intraday_strategy(cfg)
+                intraday_mismatch = (is_intraday_strategy(cfg)
                                      and interval in TIMEFRAMES and TIMEFRAMES[interval].duration >= pd.Timedelta(days=1))
-                own = strategy_warmup(cfg) if cfg else (1 if exp["kind"]=="buy_hold" else 100)
+                own = strategy_warmup(cfg) + signal_delay_bars
                 key = dict(provider=provider,symbol=asset,timeframe=interval,experiment=exp["id"],
                            **strategy_identity(exp))
-                for view, (_, writers, counts) in outputs.items():
-                    result_writer, trade_writer, equity_writer = writers
-                    required = own if view=="full-history" else warmup
-                    summary = dict(key,direction=exp["direction"],warmup_candles=required)
-                    first = _first_candle(candles,required,_phase,_split,exact=view!="full-history") if valid else None
-                    end = len(candles)
-                    problem = ""
-                    if intraday_mismatch:
-                        problem = "UTC-session VWAP requires intraday candles"
-                    elif not valid:
-                        problem = f"Data audit: {audit_problem(audit)}"
-                        if fill_confirmed_gaps and audit.get("internal_missing"):
-                            problem += " (only fully confirmed gaps can be filled)"
-                    elif first is None:
-                        problem = (f"Need {required} warmup candles and at least one execution candle"
-                                   if len(candles)<=required else
-                                   "Evaluation boundary needs an exact candle and enough preceding warmup")
-                    elif view=="matched-window":
-                        start_date, end_date = common[interval]
-                        first = candles.index.searchsorted(start_date)
-                        end = candles.index.searchsorted(end_date,side="right")
-                        if first >= end:
-                            problem = "No common execution dates for eligible assets in this timeframe"
-                    if problem:
-                        result_writer.writerow(dict(summary,status="skipped",message=problem))
-                        counts["skipped"] += 1
+                summary = dict(key,direction=exp["direction"],warmup_candles=own)
+                first = (_first_candle(candles, own, _phase, _split,
+                                       execution_start=execution_start) if valid else None)
+                end = len(candles)
+                problem = ""
+                if intraday_mismatch:
+                    problem = "UTC-session VWAP requires intraday candles"
+                elif not valid:
+                    problem = f"Data audit: {audit_problem(audit)}"
+                    if fill_confirmed_gaps and audit.get("internal_missing"):
+                        problem += " (only fully confirmed gaps can be filled)"
+                elif first is None and execution_start is not None and len(candles) and candles.index[-1] < execution_start:
+                    problem = "Stored candles end before the requested execution start"
+                elif first is None:
+                    problem = (f"Need {own} warmup candles and at least one execution candle"
+                               if len(candles)<=own else
+                               "No execution candles at or after the evaluation boundary")
+                if problem:
+                    record_issue("skipped", problem, summary)
+                    continue
+                window = candles.iloc[first-1:end]
+                tradable = ~synthetic.loc[window.index]
+                if provider in ("binance", "hyperliquid"):
+                    tradable &= window.volume.gt(0)
+                if not tradable.iloc[1:].any():
+                    record_issue("skipped", "No tradable execution candles", summary)
+                    continue
+                funding = None
+                if include_funding:
+                    from .funding import load_candle_funding
+                    bounds = first, end
+                    if bounds not in funding_cache:
+                        try:
+                            observed = load_candle_funding(conn, provider, asset, window.index[1:], interval)
+                            funding_cache[bounds] = observed.reindex(window.index, fill_value=0.)
+                        except ValueError as exc:
+                            funding_cache[bounds] = str(exc)
+                    funding = funding_cache[bounds]
+                    if isinstance(funding, str):
+                        record_issue("skipped", f"Funding unavailable: {funding}", summary)
                         continue
-                    window = candles.iloc[first-1:end]
-                    if synthetic.iloc[first:end].all():
-                        result_writer.writerow(dict(summary,status="skipped",message="No real execution candles"))
-                        counts["skipped"] += 1
-                        continue
-                    try:
-                        gate, prior = None, 0
-                        if cfg:
-                            if cfg["name"] not in combined_cache:
-                                combined_cache[cfg["name"]] = build_signal(candles,cfg,cache=signal_cache)
-                            combined = combined_cache[cfg["name"]]
-                            signal = (combined.clip(lower=0) if exp["direction"]=="long"
-                                      else combined.clip(upper=0))
-                            allowed = entry_mask(candles,cfg.get("entry_filters",[]),
-                                                 exp["direction"],filter_cache)
-                            gate = None if allowed is None else allowed.loc[window.index]
-                            if first >= 2 and (_phase=="evaluation" or view is not None):
-                                # A state already active before the opening boundary is not a new entry.
-                                prior = signal.iloc[first-2]
-                        else:
-                            signal = hold if exp["kind"]=="buy_hold" else trend
-                        result = simulate(window,signal.loc[window.index],atr.loc[window.index],
-                                          timeframe=interval,settings=exp["execution"],
-                                          entry_allowed=gate,prior_signal=prior)
-                    except ValueError as exc:
-                        result_writer.writerow(dict(summary,status="failed",message=str(exc)))
-                        counts["failed"] += 1
-                        continue
-                    if trimmed:
-                        summary["message"] = (f"Continuous history from {candles.index[0].isoformat()} "
-                                              f"({original_count - len(candles)} earlier candles excluded)")
-                    final = result["equity"].iloc[-1]
-                    result_writer.writerow(dict(summary,status="completed",first_execution=window.index[1],
-                                                last_candle=window.index[-1],execution_candles=len(window)-1,
-                                                synthetic_candles_used=int(synthetic.iloc[:end].sum()),
-                                                synthetic_candles_in_test_window=int(synthetic.iloc[first:end].sum()),
-                                                trades=len(result["trades"]),final_equity=final,
-                                                total_return_pct=(final/exp["execution"].initial_capital-1)*100))
-                    trade_writer.writerows(dict(key,**row) for row in result["trades"].to_dict("records"))
-                    equity_writer.writerows(dict(key,candle=date,equity=value,synthetic=bool(synthetic.at[date]))
-                                            for date,value in result["equity"].items())
+                try:
+                    gate, prior = None, 0
+                    if cfg["name"] not in combined_cache:
+                        combined_cache[cfg["name"]] = build_signal(candles,cfg,cache=signal_cache)
+                    combined = combined_cache[cfg["name"]]
+                    side = exp["direction"]
+                    signal = combined.clip(lower=0) if side == "long" else combined.clip(upper=0)
+                    # Invert the order side after evaluating the original entry rules.
+                    filter_side = ("short" if side == "long" else "long") if cfg.get("invert_signal") else side
+                    allowed = entry_mask(candles, cfg.get("entry_filters", []), filter_side, filter_cache)
+                    if signal_delay_bars:
+                        signal = signal.shift(signal_delay_bars, fill_value=0)
+                        if allowed is not None:
+                            allowed = allowed.shift(signal_delay_bars, fill_value=False)
+                    gate = None if allowed is None else allowed.loc[window.index]
+                    if first >= 2:
+                        # A state already active before the opening boundary is not a new entry.
+                        prior = signal.iloc[first-2]
+                    result = simulate(window,signal.loc[window.index],strategy_atr.loc[window.index],
+                                      timeframe=interval,settings=exp["execution"],
+                                      entry_allowed=gate,prior_signal=prior,funding=funding,tradable=tradable,
+                                      preview_next_open=signal_writer is not None,
+                                      record_history=not signals_only)
+                except ValueError as exc:
+                    record_issue("failed", str(exc), summary)
+                    continue
+                for order in result["next_open_orders"]:
+                    order["signal_candle_utc"] -= signal_delay_bars * TIMEFRAMES[interval].duration
+                    if order["event"] == "entry" and order["signal_candle_utc"] == latest_signal_candle:
+                        latest_entries.append(dict({k: v for k, v in key.items() if k != "experiment"}, **order))
+                if signals_only:
                     counts["completed"] += 1
+                    continue
+                if trimmed:
+                    summary["message"] = (f"Continuous history from {candles.index[0].isoformat()} "
+                                          f"({original_count - len(candles)} earlier candles excluded)")
+                final = result["equity"].iloc[-1]
+                result_writer.writerow(dict(summary,status="completed",first_execution=window.index[1],
+                                            last_candle=window.index[-1],execution_candles=len(window)-1,
+                                            synthetic_candles_used=int(synthetic.iloc[:end].sum()),
+                                            synthetic_candles_in_test_window=int(synthetic.iloc[first:end].sum()),
+                                            non_tradable_candles=int((~tradable.iloc[1:]).sum()),
+                                            trades=len(result["trades"]),final_equity=final,
+                                            total_return_pct=(final/exp["execution"].initial_capital-1)*100,
+                                            funding_paid=result["trades"].funding_paid.sum() if include_funding else ""))
+                trades = result["trades"]
+                if signal_delay_bars and not trades.empty:
+                    # Retain the original decision candle in the exported trade log.
+                    trades["signal_candle"] -= signal_delay_bars * TIMEFRAMES[interval].duration
+                trade_writer.writerows(dict(key,**row) for row in trades.to_dict("records"))
+                if equity_writer is None:
+                    curve = result["equity"]
+                    metric_rows[interval, asset, exp["id"]] = metrics(
+                        curve, trades, interval, bar_exposure(curve.index, trades)
+                    )
+                else:
+                    identity = tuple(key[column] for column in columns)
+                    equity_writer.writerows(
+                        (*identity, date, value, flag)
+                        for date, value, flag in zip(
+                            equity_dates[first-1:end], result["equity"].tolist(),
+                            equity_synthetic[first-1:end], strict=True)
+                    )
+                counts["completed"] += 1
             if on_progress is not None:
                 on_progress(i,len(pairs),asset,interval)
 
-    saved = []
-    comparison_id = uuid4().hex if both_views else None
-    for view, (folder, _, counts) in outputs.items():
-        manifest = dict(
-            version=1, provider=provider, as_of=str(cutoff), database=str(Path(database).resolve()),
-            evaluation="historical descriptive; no holdout or parameter selection",
-            independent_capital_per_pair=True, shorts="hypothetical; excludes funding, borrow and venue liquidation",
-            warmup_candles=warmup, asset_timeframe_pairs=len(pairs),
-            strategy_configs=len(configs), unique_strategy_settings=settings_count,
-            directional_strategy_configs=directional_count,
-            benchmark_configs=len(experiments)-directional_count,
-            planned_strategy_jobs=len(pairs)*directional_count, planned_jobs=len(pairs)*len(experiments),
-            jobs=counts, experiments=[dict(exp, execution=asdict(exp["execution"])) for exp in experiments],
-            history_policy=("carry forward confirmed empty candles" if fill_confirmed_gaps else
-                            "latest continuous history" if latest_continuous else "strict audit"),
-            coverage=coverage, duplicate_signal_votes={cfg["name"]: duplicate_signal_count(cfg)
-                                                       for cfg in configs if duplicate_signal_count(cfg)},
-        )
-        if _phase:
-            manifest.update(phase=_phase, split_id=_split_id, evaluation_start=str(_split),
-                            evaluation=("development; historical"
-                                        if _phase=="development" else
-                                        "historical evaluation; not an untouched forward test"))
-        if view:
-            manifest["window_view"] = view
-            manifest["comparison_id"] = comparison_id
-            manifest["window_policy"] = ("own strategy warmup; dates can differ" if view=="full-history"
-                                         else "fresh simulations on one common asset window per timeframe")
-            if view=="full-history":
-                manifest["warmup_candles"] = None
-            else:
-                manifest["matched_dates"] = {interval: dict(first_execution=str(start),last_candle=str(end))
-                                             for interval,(start,end) in common.items() if start<=end}
-        (folder/"manifest.json").write_text(json.dumps(manifest,indent=2,default=str)+"\n",encoding="utf-8")
-        saved.append((folder,manifest))
-    return saved if both_views else saved[0]
+        if signal_writer is not None:
+            signal_writer.writerows(latest_entries)
+
+    if signals_only:
+        issues = [
+            {"Status": status, "Reason": message, "Replays": count,
+             "Example (asset / timeframe / experiment)": replay_examples[status, message]}
+            for (status, message), count in replay_issues.most_common()
+        ]
+        return folder, {"jobs": counts, "latest_signal_candle_utc": latest_signal_candle,
+                        "replay_issues": issues}
+
+    manifest = dict(
+        version=1, provider=provider, as_of=str(cutoff), database=str(Path(database).resolve()),
+        evaluation="historical descriptive; no holdout or parameter selection",
+        independent_capital_per_pair=True,
+        shorts="hypothetical; excludes borrowing and venue liquidation",
+        funding_model=("observed signed rates using candle-close oracle proxy" if include_funding else "off"),
+        execution_start=str(execution_start) if execution_start is not None else None,
+        signal_delay_bars=signal_delay_bars,
+        window_view="full-history", asset_timeframe_pairs=len(pairs),
+        strategy_configs=len(configs), unique_strategy_settings=settings_count,
+        directional_strategy_configs=directional_count,
+        planned_strategy_jobs=len(pairs)*directional_count, planned_jobs=len(pairs)*len(experiments),
+        jobs=counts, experiments=[dict(exp, execution=asdict(exp["execution"])) for exp in experiments],
+        history_policy=("carry forward confirmed empty candles" if fill_confirmed_gaps else
+                        "latest continuous history" if latest_continuous else "strict audit"),
+        coverage_on=str(coverage_on) if coverage_on is not None else None,
+        coverage=coverage, duplicate_signal_votes={cfg["name"]: duplicate_signal_count(cfg)
+                                                   for cfg in configs if duplicate_signal_count(cfg)},
+    )
+    if signal_writer is not None:
+        manifest["latest_signal_candle_utc"] = latest_signal_candle
+    if _phase:
+        manifest.update(phase=_phase, split_id=_split_id, evaluation_start=str(_split),
+                        evaluation=("development; historical"
+                                    if _phase=="development" else
+                                    "historical evaluation; not an untouched forward test"))
+    (folder/"manifest.json").write_text(json.dumps(manifest, indent=2, default=str)+"\n", encoding="utf-8")
+    if not save_equity:
+        from .report import export_metrics
+
+        export_metrics(folder, metric_rows=metric_rows)
+    return folder, manifest
 
 
 def run_split(configs, database, output_root, *, evaluation_start, timeframe="1d",
-              symbol=None, as_of=None, on_progress=None, both_views=False,
-              latest_continuous=False, fill_confirmed_gaps=False):
-    """Run fixed daily periods with frozen configs and a single database snapshot."""
+              symbol=None, as_of=None, on_progress=None,
+              latest_continuous=False, fill_confirmed_gaps=False, coverage_on=None,
+              execution_start=None, include_funding=False, signal_delay_bars=0, save_equity=True,
+              signals_only=False):
+    """Run a fixed chronological split with frozen configs and one database snapshot."""
     split = pd.to_datetime(evaluation_start, utc=True)
     cutoff = pd.Timestamp.now(tz="UTC") if as_of is None else pd.to_datetime(as_of, utc=True)
-    if timeframe != "1d":
-        raise ValueError("The fixed split currently requires daily (1d) candles")
-    if pd.isna(split) or pd.isna(cutoff) or split != split.normalize() or split >= cutoff:
-        raise ValueError("Evaluation start must be UTC midnight before the run cutoff")
+    if timeframe not in TIMEFRAMES:
+        raise ValueError("A fixed split requires one supported timeframe")
+    if pd.isna(split) or pd.isna(cutoff) or split != split.floor(TIMEFRAMES[timeframe].duration) or split >= cutoff:
+        raise ValueError("Evaluation start must align with a UTC candle open before the run cutoff")
+    if execution_start is not None:
+        execution_start = pd.to_datetime(execution_start, utc=True)
+        if pd.isna(execution_start) or execution_start >= split:
+            raise ValueError("Execution start must precede the historical evaluation split")
     configs = list(configs)
     split_id = uuid4().hex
     results = []
     with open_ohlcv(database) as conn:
-        for phase, end in (("development", split), ("evaluation", cutoff)):
-            callback = None
-            if on_progress is not None:
+        batch_folder = _new_batch_folder(output_root)
+        periods = (("evaluation", cutoff),) if signals_only else (("development", split), ("evaluation", cutoff))
+        for phase, end in periods:
+            callback = on_progress
+            if on_progress is not None and not signals_only:
                 offset = 0 if phase == "development" else 1
                 callback = lambda i,n,s,t: on_progress(offset*n+i,2*n,s,f"{t} / {phase}")
             batch = run_batch(configs,database,output_root,symbol=symbol,timeframe=timeframe,
                                      as_of=end,on_progress=callback,_connection=conn,_split=split,
-                                     _phase=phase,_split_id=split_id,both_views=both_views,
-                                     latest_continuous=latest_continuous, fill_confirmed_gaps=fill_confirmed_gaps)
-            results.extend(batch if both_views else [batch])
+                                     _phase=phase,_split_id=split_id,_batch_folder=batch_folder,
+                                     latest_continuous=latest_continuous, fill_confirmed_gaps=fill_confirmed_gaps,
+                                     coverage_on=coverage_on, execution_start=execution_start,
+                                     include_funding=include_funding, signal_delay_bars=signal_delay_bars,
+                                     save_equity=save_equity, signals_only=signals_only)
+            results.append(batch)
     return results

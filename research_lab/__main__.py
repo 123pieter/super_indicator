@@ -64,12 +64,10 @@ def workbook_strategies(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["check-data", "demo-engine", "check-signals", "check-workbook", "run-batch", "report"])
+    parser.add_argument("command", choices=["check-data", "demo-engine", "check-signals", "check-workbook", "run-batch"])
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument("--workbook", help="Strategy workbook path (defaults to the project workbook)")
     parser.add_argument("--strategy-name", action="append", help="Exact workbook strategy name; repeat to select several")
-    parser.add_argument("--run", help="Completed batch folder for report")
-    parser.add_argument("--experiment", help="Experiment ID to inspect in the report")
     parser.add_argument("--symbol")
     parser.add_argument("--timeframe", choices=TIMEFRAMES)
     parser.add_argument("--database", default=DB_PATH)
@@ -77,23 +75,22 @@ def main(argv=None):
                         help="For a batch, use the latest uninterrupted history after internal gaps")
     parser.add_argument("--fill-confirmed-gaps", action="store_true",
                         help="For a batch, carry the close across confirmed empty intervals")
-    parser.add_argument("--evaluation-start", help="Split daily batch at this UTC date")
+    parser.add_argument("--evaluation-start", help="Split the selected timeframe at this UTC candle open")
     parser.add_argument("--as-of", help="Optional UTC audit cutoff (ISO datetime)")
+    parser.add_argument("--execution-start", help="Earliest UTC execution timestamp; earlier prices can warm up")
+    parser.add_argument("--coverage-on", help="Require a stored candle on this UTC date")
+    parser.add_argument("--include-funding", action="store_true",
+                        help="Estimate funding from verified stored settlements and candle-close notional")
+    parser.add_argument("--signal-delay-bars", type=int, default=0,
+                        help="Extra candles before acting on strategy signals")
     args = parser.parse_args(argv)
     if args.command == "demo-engine":
         return demo()
-    if args.command != "report" and args.provider is None:
+    if args.provider is None:
         parser.error(f"{args.command} requires --provider")
     if args.command == "check-signals" and (not args.symbol or not args.timeframe):
         parser.error("check-signals requires --symbol and --timeframe")
-    if args.command == "report" and not args.run:
-        parser.error("report requires --run")
     try:
-        if args.command == "report":
-            from .report import generate_report
-            print(generate_report(args.run, symbol=args.symbol, timeframe=args.timeframe,
-                                  experiment=args.experiment))
-            return 0
         if args.command in ("check-workbook", "check-signals", "run-batch"):
             configs = workbook_strategies(args)
             if args.command == "check-workbook":
@@ -103,17 +100,21 @@ def main(argv=None):
                 return 0
             if args.command == "check-signals":
                 return check_signals(args, configs)
+            from .report import export_metrics
             from .runner import RUNS_DIR, run_batch, run_split
-            options = dict(symbol=args.symbol, timeframe=args.timeframe, as_of=args.as_of,both_views=True,
+            options = dict(symbol=args.symbol, timeframe=args.timeframe, as_of=args.as_of,
                            latest_continuous=args.latest_continuous, fill_confirmed_gaps=args.fill_confirmed_gaps,
+                           coverage_on=args.coverage_on, execution_start=args.execution_start,
+                           include_funding=args.include_funding, signal_delay_bars=args.signal_delay_bars,
                            on_progress=lambda i,n,s,t: print(f"[{i}/{n}] {s} / {t}", flush=True))
             if args.evaluation_start:
                 options["timeframe"] = args.timeframe or "1d"
                 saved = run_split(configs, args.database, RUNS_DIR,
                                   evaluation_start=args.evaluation_start, **options)
             else:
-                saved = run_batch(configs, args.database, RUNS_DIR, **options)
+                saved = [run_batch(configs, args.database, RUNS_DIR, **options)]
             for folder, manifest in saved:
+                export_metrics(folder)
                 print(f"{manifest.get('phase', 'Historical batch')} / {manifest['window_view']}: {manifest['jobs']}")
                 print(f"Outputs: {folder}")
             return int(any(m["jobs"]["failed"] or m["jobs"]["skipped"] for _,m in saved))

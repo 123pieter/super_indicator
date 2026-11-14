@@ -596,6 +596,7 @@ def _research_workbook_form(provider):
         "low_choppiness": "Choppiness Index at or below the threshold.",
         "high_trend_efficiency": "Net close movement as a percent of total absolute close movement, at or above the threshold.",
         "low_trend_efficiency": "Net close movement as a percent of total absolute close movement, at or below the threshold.",
+        "natr_max": "Normalized ATR at or below the threshold, expressed as a percentage of price.",
         "low_realized_volatility": "Current realized volatility percentile at or below the threshold, ranked against the previous five lookback windows.",
     }
     filters = [{"Strategy": cfg["name"], **item,
@@ -624,7 +625,7 @@ def _research_batch_controls(strategies):
     import sqlite3
     from research_lab.data import open_ohlcv, stored_pairs
     from research_lab.report import export_metrics
-    from research_lab.runner import RUNS_DIR, run_batch, run_split, shared_warmup, strategy_directions
+    from research_lab.runner import RUNS_DIR, run_batch, run_split, strategy_directions
 
     st.subheader("Run research batch")
     by_name = {c["name"]: c for c in strategies}
@@ -652,7 +653,7 @@ def _research_batch_controls(strategies):
     timeframe = None if chosen_interval == all_intervals else chosen_interval
     symbols = sorted({symbol for symbol, interval in pairs if timeframe is None or interval == timeframe})
     all_symbols = "All stored assets"
-    symbol_choice = st.selectbox("Batch asset", [all_symbols, *symbols], index=1,
+    symbol_choice = st.selectbox("Batch asset", [all_symbols, *symbols], index=0,
                                  key=f"research_batch_asset_{provider}_{chosen_interval}")
     symbol = None if symbol_choice == all_symbols else symbol_choice
     coverage_on = None
@@ -670,15 +671,10 @@ def _research_batch_controls(strategies):
                 return
     count = sum((symbol is None or s == symbol) and (timeframe is None or t == timeframe)
                 for s, t in pairs)
-    cost_groups = {tuple(c["execution"][key] for key in ("initial_capital","fee","slippage"))
-                   for c in configs}
     signal_delay_bars = st.number_input(
         "Extra signal delay (candles)", min_value=0, value=0, step=1,
         help="0 executes at the next open. 1 waits one additional candle for strategy entries and signal-driven exits.")
-    warmup = shared_warmup(configs) + signal_delay_bars
-    st.caption(f"Matched window: {warmup} completed candles of warmup, then common dates for the largest "
-               "overlapping asset group in each timeframe. Full history: each strategy starts when its own inputs are ready. "
-               "Both views are saved separately.")
+    st.caption("Each strategy uses the available history after its own warmup.")
 
     history_policy = st.selectbox(
         "History with missing candles",
@@ -714,23 +710,27 @@ def _research_batch_controls(strategies):
     if timeframe is None:
         evaluation_start = None
     if evaluation_start:
-        st.info("The date is the first evaluation open. The same strategies run in both periods; "
+        st.info("Evaluation starts on or after the selected date, once the strategy has enough history. The same strategies run in both periods; "
                 "this is historical evaluation, not an untouched forward test.")
-    runs = 4 if evaluation_start else 2
+    runs = 2 if evaluation_start else 1
     directional_count = sum(len(strategy_directions(cfg)) for cfg in configs)
-    st.caption(f"{directional_count} directional strategies × {count} asset/timeframe pairs × {runs} saved views "
-               f"= {directional_count*count*runs} planned strategy simulations. "
-               f"{2*len(cost_groups)*count*runs} benchmark simulations are also planned.")
+    st.caption(f"{directional_count} directional strategies × {count} asset/timeframe pairs × {runs} periods "
+               f"= {directional_count*count*runs} planned strategy simulations.")
     if not count:
         st.info("No asset/timeframe pairs meet the selected coverage date.")
     save_equity = st.checkbox("Save equity.csv", value=False,
                               help="Keep the per-candle equity history in each run folder.")
-    if st.button("Run research batch", type="primary", disabled=not count):
-        progress = st.progress(0., text="Preparing research batch…")
+    run_full = st.button("Run research batch", type="primary", disabled=not count)
+    signals_only = st.button(
+        "Generate latest signals only", disabled=not count,
+        help="Replay the strategies and write only latest_signals.csv. With a historical split, use the evaluation period.",
+    )
+    if run_full or signals_only:
+        progress = st.progress(0., text="Preparing latest signals…" if signals_only else "Preparing research batch…")
         try:
-            options = dict(symbol=symbol, timeframe=timeframe, both_views=True, coverage_on=coverage_on,
+            options = dict(symbol=symbol, timeframe=timeframe, coverage_on=coverage_on,
                            execution_start=execution_start, include_funding=include_funding, as_of=as_of,
-                           signal_delay_bars=signal_delay_bars,
+                           signal_delay_bars=signal_delay_bars, save_equity=save_equity, signals_only=signals_only,
                            latest_continuous=history_policy == "Latest continuous history",
                            fill_confirmed_gaps=history_policy == "Carry forward confirmed empty candles",
                            on_progress=lambda i,n,s,t: progress.progress(i/n,text=f"{i}/{n}: {s} / {t}"))
@@ -738,60 +738,31 @@ def _research_batch_controls(strategies):
                 saved = run_split(configs, config.DB_PATH, RUNS_DIR,
                                   evaluation_start=evaluation_start, **options)
             else:
-                saved = run_batch(configs, config.DB_PATH, RUNS_DIR, **options)
+                saved = [run_batch(configs, config.DB_PATH, RUNS_DIR, **options)]
         except (ValueError, OSError, sqlite3.Error) as exc:
-            st.error(f"Research batch failed: {exc}")
+            st.error(f"{'Signal generation' if signals_only else 'Research batch'} failed: {exc}")
         else:
-            for i, (path, _) in enumerate(saved, 1):
-                progress.progress(i / len(saved), text=f"Writing CSV exports {i} of {len(saved)}…")
-                try:
-                    export_metrics(path, save_equity=save_equity)
-                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    st.warning(f"Saved {path.name}. CSV export failed. {exc}")
-            folder, manifest = saved[-1]
-            st.session_state["last_research_batch"] = dict(
-                folder=str(folder), jobs=manifest["jobs"], name=", ".join(c["name"] for c in configs),
-                provider=provider, symbol=symbol_choice, timeframe=chosen_interval, signal_delay_bars=signal_delay_bars,
-                views=[dict(folder=str(path),jobs=m["jobs"],
-                            label=" / ".join(part for part in
-                                (m.get("phase"),m["window_view"].replace("-"," ")) if part))
-                       for path,m in saved],
-            )
+            if not signals_only and save_equity:
+                for i, (path, _) in enumerate(saved, 1):
+                    progress.progress(i / len(saved), text=f"Writing CSV exports {i} of {len(saved)}…")
+                    try:
+                        export_metrics(path)
+                    except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+                        st.warning(f"Saved {path.name}. CSV export failed. {exc}")
+            st.session_state["last_signal_replay_summary"] = saved[0][1] if signals_only else None
+            st.session_state["last_research_output_folders"] = [str(path) for path, _ in saved]
         finally:
             progress.empty()
 
-    last = st.session_state.get("last_research_batch")
-    if last:
-        from pathlib import Path
-        st.caption(f"Last batch: {last['name']} | {last['provider']} / {last['symbol']} / {last['timeframe']}"
-                   f" | Extra signal delay: {last.get('signal_delay_bars', 0)} candles")
-        views = last.get("views")
-        selected = last
-        if views:
-            choice = st.selectbox("Batch result view", range(len(views)), index=len(views)-1,
-                                  format_func=lambda i: views[i]["label"])
-            selected = views[choice]
-        jobs = selected["jobs"]
-        status = st.warning if jobs["failed"] or jobs["skipped"] else st.success
-        status(f"{jobs['completed']} completed, {jobs['skipped']} skipped, {jobs['failed']} failed.")
-        st.code(selected["folder"], language=None)
-        try:
-            results = (Path(selected["folder"])/"results.csv").read_bytes()
-            from io import BytesIO
-            # Blank metrics on skipped runs must still have a numeric column type.
-            numeric_types = {
-                "strategy_number": "Int64", "warmup_candles": "Int64", "execution_candles": "Int64",
-                "synthetic_candles_used": "Int64", "synthetic_candles_in_test_window": "Int64",
-                "non_tradable_candles": "Int64",
-                "trades": "Int64", "final_equity": "Float64", "total_return_pct": "Float64", "funding_paid": "Float64",
-            }
-            frame = pd.read_csv(BytesIO(results), dtype={"symbol": str, **numeric_types},
-                                keep_default_na=False, na_values={key: [""] for key in numeric_types})
-            st.dataframe(frame, hide_index=True, width="stretch")
-            st.download_button("Download batch results", results, file_name="results.csv", mime="text/csv")
-            signals = Path(selected["folder"])/"latest_signals.csv"
-            if signals.is_file():
-                st.download_button("Download latest signals", signals.read_bytes(),
-                                   file_name=signals.name, mime="text/csv")
-        except OSError as exc:
-            st.warning(f"Unable to read saved results: {exc}")
+    folders = st.session_state.get("last_research_output_folders")
+    if folders:
+        st.caption("Last research output folders")
+        st.code("\n".join(folders), language=None)
+
+
+    replay = st.session_state.get("last_signal_replay_summary")
+    if replay and replay.get("replay_issues"):
+        jobs = replay["jobs"]
+        st.warning(f"{jobs['skipped']} strategy replays skipped and {jobs['failed']} failed.")
+        with st.expander("Why strategy replays were skipped or failed"):
+            st.dataframe(replay["replay_issues"], hide_index=True, width="stretch")

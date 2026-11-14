@@ -26,12 +26,23 @@ def open_ohlcv(database):
         yield conn
 
 
-def stored_pairs(conn, provider):
-    """List stored symbol/timeframe pairs, including unsupported intervals for audit."""
-    return conn.execute(
-        "SELECT DISTINCT symbol, timeframe FROM ohlcv WHERE provider=? ORDER BY timeframe, symbol",
-        (provider,),
-    ).fetchall()
+def stored_pairs(conn, provider, *, coverage_on=None, symbol=None, timeframe=None):
+    """List stored pairs, optionally requiring an observed candle start on a UTC date."""
+    query = "SELECT DISTINCT symbol, timeframe FROM ohlcv WHERE provider=?"
+    params = [provider]
+    if symbol is not None:
+        query += " AND symbol=?"
+        params.append(symbol)
+    if timeframe is not None:
+        query += " AND timeframe=?"
+        params.append(timeframe)
+    if coverage_on is not None:
+        day = pd.to_datetime(coverage_on, utc=True)
+        if pd.isna(day) or day != day.normalize():
+            raise ValueError("Coverage date must be a UTC calendar date")
+        query += " AND date>=? AND date<?"
+        params.extend((day.strftime("%Y-%m-%d"), (day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+    return conn.execute(query + " ORDER BY timeframe, symbol", params).fetchall()
 
 
 def load_pair(conn, provider, symbol, timeframe, as_of=None, *, historical_cutoff=False):

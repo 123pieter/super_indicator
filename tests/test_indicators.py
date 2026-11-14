@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
-from analyze import compute_indicators, wilder, SIGNAL_COLS
+from analyze import compute_indicators, SIGNAL_COLS
 from tests.helpers import bars
 
 
@@ -64,13 +64,6 @@ class IndicatorCalculationTests(unittest.TestCase):
         values = compute_indicators(bars()).super_score.dropna()
         self.assertTrue(values.between(0, 1).all())
 
-    def test_wilder_sma_seed_and_recursion(self):
-        """The first three observations seed at 2; the next follows Wilder's recursion."""
-        actual = wilder(pd.Series([np.nan, 1., 2., 3., 8.]), 3)
-        self.assertTrue(actual.iloc[:3].isna().all())
-        self.assertEqual(actual.iloc[3], 2.)
-        self.assertEqual(actual.iloc[4], 4.)
-
     def test_rsi_seed_known_gains_and_losses(self):
         """RSI14 starts from arithmetic means of the first 14 actual price changes."""
         df = bars(30)
@@ -84,8 +77,8 @@ class IndicatorCalculationTests(unittest.TestCase):
     def test_atr_adx_known_trending_reference(self):
         """Constant true range seeds ATR at 4 and an uninterrupted uptrend gives ADX100."""
         ind = compute_indicators(bars())
-        self.assertAlmostEqual(ind.atr.iloc[13], 4.)
-        self.assertTrue(np.isnan(ind.atr.iloc[12]))
+        self.assertAlmostEqual(ind.atr.iloc[14], 4.)
+        self.assertTrue(np.isnan(ind.atr.iloc[13]))
         self.assertAlmostEqual(ind.adx.iloc[-1], 100.)
 
     def test_flat_stochastic_and_nine_votes(self):

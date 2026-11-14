@@ -243,10 +243,18 @@ The sidebar timeframe still controls analysis.
 
 ## Research lab
 
-Edit the project workbook in the research_configs folder. Its **User Manual**
-explains how to define indicator instances and combine them into strategies.
-In Streamlit, open **Research lab → Settings** to preview the project workbook
-or upload another workbook, then choose what to run under **Run batch**.
+Edit strategies in `research_configs/strategies_config.xlsx`. Its **User Manual**
+explains the indicator, strategy, and entry filter sheets. In `strategies`, set
+`signal_mode` to `normal`, `inverted`, or `both`. A blank cell means normal.
+Inversion flips the executed side and uses the original signal's entry filters.
+
+To test several parameter values in one batch, enter a comma-separated list in
+the `value` cell in `individual_indicator_settings`. Every strategy using
+that indicator expands across those choices. The batch shows each variant by name.
+
+Save the workbook, choose a **Research data provider**, and preview it under
+**Research lab → Settings**. Select the desired configurations, assets and
+timeframe under **Run batch**. Open the CSV exports in the run folder shown in the app.
 
 From the project PowerShell terminal:
 
@@ -256,8 +264,7 @@ From the project PowerShell terminal:
 ```
 
 Use **--workbook** to select another workbook and repeat **--strategy-name**
-to select specific strategies. Saved runs keep their manifests so their reports
-can be opened independently of later workbook edits.
+to select specific strategies. Saved runs keep the tested configurations in their manifests.
 
 ### Donchian breakout
 
@@ -273,10 +280,9 @@ contribute to either channel. Execution is at the next candle open;
 configured ATR stops and targets still apply.
 
 
-Research batches run each selected strategy twice: long only and short only.
-Each direction starts with its own capital, and an opposite signal is treated
-as cash. Reports show separate directional trade logs and equity curves.
-Buy-and-hold and SMA100 long/cash remain long-side benchmarks.
+Research batches replay the directions configured for each selected strategy.
+Each direction starts with independent capital. The batch includes only the selected
+workbook strategies and writes trade logs and metrics. Equity CSV export is optional.
 
 ### Donchian filter comparison
 
@@ -285,23 +291,49 @@ share Donchian 40/20, sizing, costs and exits. Filters in the optional
 **strategy_entry_filters** sheet are ANDed at the signal close. A rejected
 transition is not retried when filters later pass, and filters never exit a trade.
 
-For daily candles, **Evaluation start (UTC)** (CLI: **--evaluation-start YYYY-MM-DD**)
-creates separate development and evaluation runs from one SQLite read snapshot.
-Both use the same frozen settings and start with independent capital. The
-evaluation needs a candle exactly at the boundary and sufficient prior warmup.
-A pre-boundary signal state is not treated as a fresh entry. The benchmarks
-initialize from the boundary, using only information already available.
-Open either phase in **Reports**. Historical evaluation is not an untouched forward test.
+Select one timeframe to use **Evaluation start (UTC)**. The app splits at UTC
+midnight. The CLI accepts **--evaluation-start** at any UTC candle open aligned
+to the selected timeframe. Both paths use one SQLite read snapshot for the
+development and evaluation runs.
+Both use the same frozen settings and start with independent capital.
+A signal already active before the execution boundary is not a fresh entry.
+Each phase has its own output folder.
 
-### Research batch windows
+### Research batch history
 
-The app and batch command save two views. **Full history** uses each strategy's
-own indicator, filter and risk warmup; use it to inspect an individual history.
-**Matched window** reruns all included strategies and benchmarks on common
-execution dates across eligible assets within each timeframe. Strategies start
-flat and a state already active before the boundary is not a fresh entry.
-An asset can have a valid full-history result while being skipped in the matched
-view. Dates, warmup and execution candle counts are included in the output.
+Each strategy uses its available history after its own indicator, filter, and risk
+warmup. The overall metrics summarize completed assets with equal weight.
+Streamlit shows the output folder paths.
 
-When a daily split is set, each period saves both views. Pick the table using
-**Batch result view**, or select a saved folder under **Reports**.
+**Extra signal delay (candles)** (CLI: **--signal-delay-bars**) lets you check
+sensitivity to slower execution. Zero uses the next open. One waits an
+additional candle before strategy entries and signal-driven exits. The setting
+is recorded in each run's manifest.
+
+[November 2026 Hyperliquid research continuation](documentation/research_2026-11-12_continuation.md)
+
+In Streamlit, select **Save equity.csv** to keep the per-candle equity history.
+The checkbox defaults to off. The metric CSVs are exported with either setting.
+
+### Latest strategy signals
+
+Open `latest_signals.csv` in the full-history output folder. For a chronological
+split, use the evaluation full-history folder. The export contains pending
+entries whose signal candle matches the newest completed UTC candle timestamp
+across all selected pairs. The file has headers only if that candle produced
+no eligible entries. A daily candle dated 9 November schedules execution for
+10 November. Entry levels use the latest close plus modeled slippage as a
+reference. The actual opening fill determines final stop-loss and take-profit
+prices.
+
+### TA-Lib indicator checks
+
+From the project PowerShell terminal, install and run the reference tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-indicator-tests.txt
+.\.venv\Scripts\python.exe -B -m unittest tests.test_talib_reference
+```
+
+The tests cover RSI, ATR and ADX/DMI warmup, smoothing and flat-price behavior.
+Research Lab uses TA-Lib for Aroon Oscillator, KAMA and the Normalized ATR entry filter.
